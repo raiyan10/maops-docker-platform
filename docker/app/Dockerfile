@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# Resolved from the live Docker Hub registry on 2026-08-18:
+#   docker pull python:3.13-slim
+#   -> python@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a
+#   (Python 3.13.15, Debian 13 "trixie")
+FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a
+
+LABEL org.opencontainers.image.title="maops-docker-platform" \
+      org.opencontainers.image.description="Secure Python stdlib HTTP workload demonstrating Docker/container engineering practices" \
+      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.licenses="MIT"
+# org.opencontainers.image.source is intentionally omitted on Day 1: no
+# GitHub repository exists yet for this project, and this label must not
+# assert a URL that does not truthfully resolve. Add it once the
+# repository is created and pushed.
+
+# Dedicated, fixed-ID non-root user/group. No login shell, no home
+# directory needed for a stateless HTTP workload.
+RUN groupadd --gid 10001 appgroup \
+    && useradd --uid 10001 --gid appgroup --no-create-home --shell /usr/sbin/nologin appuser
+
+WORKDIR /app
+
+# Read-only root filesystem is expected at runtime (see compose.yaml): never
+# attempt to write .pyc bytecode caches, and always flush stdout/stderr
+# immediately so log lines are never buffered/lost on shutdown.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY --chown=10001:10001 app/ ./app/
+COPY --chown=10001:10001 VERSION ./VERSION
+
+USER 10001:10001
+
+EXPOSE 8080
+
+# Stdlib-only probe (no curl/wget installed merely for HEALTHCHECK).
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["python3", "-m", "app.healthcheck"]
+
+ENTRYPOINT ["python3", "-m", "app"]

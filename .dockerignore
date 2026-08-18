@@ -1,0 +1,66 @@
+# Repository/development-only content excluded from the Docker build context.
+#
+# IMPORTANT: Docker's .dockerignore glob semantics are NOT identical to
+# .gitignore. A bare `app/__pycache__/*.pyc` only matches one specific
+# nesting level and silently lets nested __pycache__ directories leak into
+# the image (a real prior review finding). Every pattern below that must
+# apply at any depth uses an explicit `**/` prefix.
+
+# Version control / CI / assistant tooling
+.git
+.git/**
+.github
+.github/**
+.claude
+.claude/**
+
+# Virtual environments
+.venv
+.venv/**
+venv/**
+env/**
+
+# Tests, docs, and non-runtime assets
+tests
+tests/**
+docs
+docs/**
+screenshots/**
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.gif
+**/*.svg
+
+# Build/dist output
+build/**
+dist/**
+**/*.egg-info
+**/*.egg-info/**
+
+# Editor / OS files
+.vscode/**
+.idea/**
+**/*.swp
+**/*.swo
+**/*~
+.DS_Store
+**/.DS_Store
+
+# Python bytecode / cache directories (recursive at any depth)
+**/__pycache__/
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.pytest_cache/**
+**/.mypy_cache/
+**/.mypy_cache/**
+**/.ruff_cache/
+**/.ruff_cache/**
+
+# Local temporary/generated state
+*.log
+.env
+.env.*
