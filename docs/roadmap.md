@@ -1,7 +1,7 @@
 # Roadmap
 
-Seven-day portfolio arc. Only Day 1 is implemented; everything under a
-later day below is **planned, not implemented** — do not read a later
+Seven-day portfolio arc. Only Days 1-2 are implemented; everything under
+a later day below is **planned, not implemented** — do not read a later
 day's bullet list as describing current behavior.
 
 ## Day 1 — Secure container foundation (v0.1.0, implemented)
@@ -43,12 +43,52 @@ day's bullet list as describing current behavior.
   `.claude/` for Docker architecture, container security, Compose
   platform engineering, Docker testing, and release engineering.
 
-## Day 2 — Compose multi-service topology (planned)
+## Day 2 — Compose multi-service topology (v0.2.0, implemented)
 
-A second Compose-managed service and the networking/dependency
-relationship between it and the Day 1 application service. No specific
-technology chosen yet — chosen when Day 2 actually starts, not
-pre-decided here.
+- A new `gateway/` package (stdlib-only, no third-party dependency) added
+  alongside `app/` in the same release image: `GET /`, `/healthz`
+  (gateway-process liveness only), `/readyz` (a real, bounded HTTP check
+  against `app`'s `/readyz`), `/upstream/info` (a real, bounded HTTP call
+  to `app:8080/info`, returned wrapped, never an arbitrary-URL proxy —
+  the upstream destination is fixed at startup from
+  `UPSTREAM_HOST`/`UPSTREAM_PORT`, never influenced by an incoming
+  request, which is what prevents SSRF-style abuse).
+- `compose.yaml` now declares exactly two services: `app` (Day 1 backend,
+  no host-published port, reachable only via Compose service-name
+  discovery) and `gateway` (the sole host-published service, bound to
+  `127.0.0.1` only, `depends_on: app: condition: service_healthy`). Both
+  keep every Day 1 hardening property (`read_only`, `cap_drop: [ALL]`,
+  `no-new-privileges`, non-root `10001:10001`). See
+  `docs/compose-platform.md` for the full topology rationale.
+- `docker/app/Dockerfile` now builds one image capable of running either
+  role (`python3 -m app` or `python3 -m gateway`, both still exec-form
+  PID 1, no shell wrapper), and adds an accurate
+  `org.opencontainers.image.source` label now that the GitHub repository
+  genuinely exists.
+- `scripts/compose/check_compose.py` — a static, project-specific
+  structural validator against `docker compose config`'s rendered output
+  (service set, image/version, hardening flags, healthchecks,
+  `depends_on`, no custom network, no named volume).
+- `scripts/compose/compose_integration.py` — the runtime counterpart:
+  brings up the real two-service stack, proves gateway→app
+  service-discovery communication, exercises the app-stop/gateway-degrade
+  and app-restart/gateway-recover scenario with bounded deadlines, and
+  inspects the real Compose-created containers' hardening and PID 1
+  identity. Closes Day 1 finding M-3 (no automated check previously
+  exercised anything beyond `docker compose config`'s own syntax
+  validity).
+- `scripts/verify/security_check.py` gained an automated `docker
+  stop`/SIGTERM lifecycle regression check (closes Day 1 finding M-2) and
+  an exact `VERSION`-vs-image-label cross-check (closes the Day 1
+  version-drift review finding, alongside `check_compose.py`'s own
+  fallback-default drift check).
+- `VERSION` bumped `0.1.0` → `0.2.0`; the Dockerfile's OCI version label
+  is now derived from it via a build arg rather than a duplicated
+  literal, and hardcoded version assertions were removed from tests where
+  the value is obtainable from `VERSION` directly.
+- Still no custom network, named volume, database, cache, message broker,
+  reverse proxy, Compose secrets/configs, resource limits, or CI — all
+  explicitly Day 3+ scope (see below).
 
 ## Day 3 — Networking, configuration, volumes, persistence (planned)
 

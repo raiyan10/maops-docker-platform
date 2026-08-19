@@ -10,15 +10,16 @@ class VersionTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent.parent
         expected = (repo_root / "VERSION").read_text(encoding="utf-8").strip()
         self.assertEqual(version.get_version(), expected)
-        self.assertEqual(version.get_version(), "0.1.0")
 
     def test_reads_fresh_on_every_call(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        expected = (repo_root / "VERSION").read_text(encoding="utf-8").strip()
         # Not cached at import time: patching the source path changes the result.
         with patch.object(version, "_VERSION_FILE", Path("/nonexistent/VERSION")):
             with self.assertRaises(FileNotFoundError):
                 version.get_version()
         # Original behavior is restored after the patch context exits.
-        self.assertEqual(version.get_version(), "0.1.0")
+        self.assertEqual(version.get_version(), expected)
 
     def test_strips_surrounding_whitespace(self) -> None:
         import tempfile

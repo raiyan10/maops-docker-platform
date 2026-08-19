@@ -16,26 +16,41 @@ application is intentionally tiny — a few JSON endpoints — so that
 essentially all of the engineering effort and all of the review surface
 is the container layer, not application logic.
 
-## Day 1 functionality
+## Day 1 + Day 2 functionality
 
-- `GET /`, `/healthz`, `/readyz`, `/info` — deterministic JSON endpoints,
-  `application/json` content type, HEAD support, controlled 404 and
-  unsupported-method (405) responses, no traceback or environment
-  disclosure.
-- A digest-pinned, non-root (`10001:10001`), single-stage Dockerfile with
-  the application running directly as PID 1 and a stdlib-only
+- `app`: `GET /`, `/healthz`, `/readyz`, `/info` — deterministic JSON
+  endpoints, `application/json` content type, HEAD support, controlled
+  404 and unsupported-method (405) responses, no traceback or environment
+  disclosure. Unchanged from Day 1 except it is no longer host-published.
+- `gateway` (new, Day 2): `GET /`, `/healthz` (gateway-process liveness
+  only), `/readyz` (a real, bounded HTTP check against `app`), and
+  `/upstream/info` (a real, bounded HTTP call to `app:8080/info`,
+  returned wrapped) — the only host-published service, on `127.0.0.1`
+  only. No arbitrary-URL proxying: the upstream is fixed at startup, not
+  derived from any incoming request. See
+  [docs/compose-platform.md](docs/compose-platform.md).
+- A digest-pinned, non-root (`10001:10001`) Dockerfile building one image
+  that runs either role (`python3 -m app` or `python3 -m gateway`)
+  directly as PID 1 in exec form, with a per-role stdlib-only
   `HEALTHCHECK`.
-- A one-service `compose.yaml` with `read_only: true`, `cap_drop:
-  [ALL]`, and `security_opt: [no-new-privileges:true]`.
+- A two-service `compose.yaml` (`app`, `gateway`) — `app` not
+  host-published, `gateway` the sole host-published service on
+  `127.0.0.1` — both with `read_only: true`, `cap_drop: [ALL]`,
+  `security_opt: [no-new-privileges:true]`, and `depends_on: app:
+  condition: service_healthy`.
 - A recursively-correct `.dockerignore`, proven (not just asserted) to
   reject nested `__pycache__`/`.pyc` content.
-- `unittest`-based tests, project-specific source/Dockerfile validators,
-  a real-image smoke test, and a runtime security verifier that
-  distinguishes source configuration, Docker-runtime inspection, and
-  kernel/process-level proof (see [docs/security.md](docs/security.md)).
+- `unittest`-based tests (including gateway coverage), project-specific
+  source/Dockerfile/Compose validators, a real-image smoke test, a
+  real Compose-stack integration test, and a runtime security verifier
+  that distinguishes source configuration, Docker-runtime inspection,
+  and kernel/process-level proof, including an automated `docker
+  stop`/SIGTERM lifecycle check (see
+  [docs/security.md](docs/security.md)).
 
 See [docs/roadmap.md](docs/roadmap.md) for the full seven-day arc — only
-Day 1 is implemented; everything else is explicitly planned, not built.
+Days 1-2 are implemented; everything else is explicitly planned, not
+built.
 
 ## Prerequisites
 
@@ -49,20 +64,23 @@ Day 1 is implemented; everything else is explicitly planned, not built.
 ## Build / test / run
 
 ```bash
-make test             # unittest suite
-make lint              # project-specific source validator (app/)
-make dockerfile-check   # project-specific Dockerfile validator
-make quality              # test + lint + dockerfile-check
+make test             # unittest suite (app/ + gateway/)
+make lint              # project-specific source validator (app/, gateway/)
+make dockerfile-check    # project-specific Dockerfile validator
+make compose-check         # project-specific Compose structural validator
+make quality                 # test + lint + dockerfile-check + compose-check
 
-make build                  # docker build, tagged maops-docker-platform:<VERSION>
-make inspect                  # docker image inspect / ls / history
-make smoke                      # real-image container smoke test
-make security-check               # hardened-runtime security verification
-make release-check                  # quality + build + inspect + smoke + security-check + compose config
+make build                     # docker build, tagged maops-docker-platform:<VERSION>
+make inspect                     # docker image inspect / ls / history
+make smoke                         # real-image container smoke test (app role)
+make security-check                  # hardened-runtime security verification
+make compose-test                      # real Compose-stack integration test
+make release-check                       # quality + build + inspect + smoke + security-check + compose-test
 
-docker compose up -d                  # run the service locally
-curl http://localhost:8080/healthz      # (or any stdlib HTTP client - the
-                                          #  app itself has no curl/wget)
+docker compose up -d                       # run the stack locally
+curl http://localhost:8080/readyz            # via the gateway (loopback-only;
+                                               #  neither service has curl/wget)
+curl http://localhost:8080/upstream/info
 docker compose down
 ```
 
@@ -84,28 +102,30 @@ container boundary and PID 1 process model.
 ## Repository structure
 
 ```
-app/                    # stdlib-only Python HTTP workload
-docker/app/Dockerfile   # hardened, non-root, digest-pinned image
-compose.yaml            # one-service hardened Compose baseline
-tests/                  # unittest suite
-scripts/lint/           # project-specific source + Dockerfile validators
-scripts/smoke/          # real-image container smoke test
-scripts/verify/         # runtime security verification
-docs/                   # architecture, security, roadmap
-.claude/                # project agents, skills, and guidance
-VERSION                 # single authoritative version source
+app/                     # stdlib-only Python HTTP workload (Day 1 backend)
+gateway/                 # stdlib-only Python gateway (Day 2, sole host-facing service)
+docker/app/Dockerfile    # hardened, non-root, digest-pinned image, both roles
+compose.yaml             # two-service hardened Compose stack (app, gateway)
+tests/                   # unittest suite (app/ + gateway/)
+scripts/lint/            # project-specific source + Dockerfile validators
+scripts/compose/         # project-specific Compose structural + integration checks
+scripts/smoke/           # real-image container smoke test
+scripts/verify/          # runtime security verification
+docs/                    # architecture, security, compose platform, roadmap
+.claude/                 # project agents, skills, and guidance
+VERSION                  # single authoritative version source
 ```
 
 ## Current version
 
-`0.1.0` (see `VERSION`) — Day 1 of 7.
+`0.2.0` (see `VERSION`) — Day 2 of 7.
 
 ## Seven-day roadmap (high level)
 
 | Day | Theme |
 |---|---|
-| 1 | Secure container foundation *(this release)* |
-| 2 | Compose multi-service topology |
+| 1 | Secure container foundation |
+| 2 | Compose multi-service topology *(this release)* |
 | 3 | Networking, configuration, volumes, persistence |
 | 4 | Build/image security and reproducibility |
 | 5 | Health, reliability, resources, observability |
