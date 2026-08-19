@@ -13,11 +13,18 @@ specific day's scope explicitly calls for an application change.
 
 ## Seven-day roadmap
 
-- **Day 1 (v0.1.0, this scope)** — secure container foundation: the app,
-  a hardened single-stage Dockerfile, a one-service Compose baseline,
-  tests, source/Dockerfile validation, smoke testing, runtime security
+- **Day 1 (v0.1.0)** — secure container foundation: the app, a hardened
+  single-stage Dockerfile, a one-service Compose baseline, tests,
+  source/Dockerfile validation, smoke testing, runtime security
   verification, docs, agents, skills.
-- **Day 2** — Compose multi-service topology.
+- **Day 2 (v0.2.0, this scope)** — Compose multi-service topology: a new
+  stdlib-only `gateway/` service fronting the Day 1 `app` service, a
+  two-service `compose.yaml` (`app` not host-published, `gateway` the
+  sole loopback-published service), one image capable of running either
+  role, Compose structural + real-stack integration validation, and
+  closure of the Day 1 M-2 (PID 1/SIGTERM regression)/M-3 (Compose
+  runtime verification) test-review findings. See
+  `docs/compose-platform.md`.
 - **Day 3** — networking, configuration, volumes, persistence.
 - **Day 4** — build/image security and reproducibility.
 - **Day 5** — health, reliability, resource limits, observability.
@@ -38,12 +45,15 @@ implement a later day's scope early, even if it looks convenient.
   Docker resources by broad prefix/heuristic matching. Every script in
   this repository that creates a container uses a unique,
   project-prefixed name (e.g. `maops-smoke-<uuid>`, `maops-security-
-  <uuid>`) generated at run time, and removes only that exact container
-  in a `finally`/equivalent block — never anything it didn't create.
+  <uuid>`, or — for Compose-managed resources —
+  `maops-compose-<uuid>` as the Compose *project* name) generated at run
+  time, and removes only that exact container/project in a
+  `finally`/equivalent block — never anything it didn't create.
 - `make clean` only removes known project-owned generated resources
-  (local `__pycache__`/cache directories, and any leftover
-  `maops-smoke-*`/`maops-security-*` containers matching this project's
-  own deterministic naming scheme) — never a broad prune, never another
+  (local `__pycache__`/cache directories, any leftover
+  `maops-smoke-*`/`maops-security-*` containers, and any leftover
+  `maops-compose-*` Compose projects, all matching this project's own
+  deterministic naming scheme) — never a broad prune, never another
   project's resources.
 - The built release image (`maops-docker-platform:<VERSION>`) is left in
   place intentionally after validation; nothing in this repository's
@@ -75,14 +85,19 @@ distinction when extending security verification in later days.
 ## Implementation and testing expectations
 
 - Python standard library only at runtime — no third-party dependency in
-  `app/`. `unittest` for tests, never `pytest` merely for convenience.
+  `app/` or `gateway/`. `unittest` for tests, never `pytest` merely for
+  convenience.
+- The gateway's upstream destination (`UPSTREAM_HOST`/`UPSTREAM_PORT`) is
+  fixed at process startup and never derived from an incoming request —
+  no arbitrary-URL proxying, no SSRF-style behavior. Keep this narrow if
+  the gateway grows further.
 - Tests use loopback/in-process facilities and dynamic ports only; no
   fixed external ports, no public network, no shared mutable global test
   state, environment modifications restored on cleanup.
-- `scripts/lint/`, `scripts/smoke/`, `scripts/verify/` are project-
-  specific tools, not general-purpose scanners — each documents its own
-  real scope honestly in its own docstring/output rather than implying
-  broader coverage than it has.
+- `scripts/lint/`, `scripts/smoke/`, `scripts/verify/`, `scripts/compose/`
+  are project-specific tools, not general-purpose scanners — each
+  documents its own real scope honestly in its own docstring/output
+  rather than implying broader coverage than it has.
 - Every temporary validation container uses a unique, deterministic,
   project-prefixed name and is cleaned up via `try`/`finally` (or
   equivalent) on both success and failure paths.

@@ -20,6 +20,13 @@ This script boots its own uniquely named, hardened, throwaway container
 (read-only rootfs, all capabilities dropped, no-new-privileges), runs every
 check against it, and always removes it - on success or failure. It never
 touches any other Docker resource.
+
+Also closes Day 1 finding M-2: `check_lifecycle_docker_stop()` issues a
+real `docker stop` (real SIGTERM, bounded grace period) against the
+running container and asserts a clean, fast exit - prior to this, every
+script here only ever force-removed containers (`docker rm -f`), so a
+broken SIGTERM handler would have produced zero automated failures
+anywhere.
 """
 
 from __future__ import annotations
@@ -137,14 +144,32 @@ def check_image_healthcheck(image: str) -> CheckResult:
     return CheckResult(CAT_IMAGE, "image declares a HEALTHCHECK", True, str(test))
 
 
-def check_image_labels(image: str) -> CheckResult:
+def check_image_labels(image: str, version: str) -> CheckResult:
+    """Also cross-checks org.opencontainers.image.version against VERSION exactly.
+
+    This is what makes a forgotten `--build-arg VERSION=...` (silently
+    falling back to the Dockerfile ARG's `0.0.0-unset` default) an
+    automated release-check failure rather than a label nobody re-reads.
+    """
     config = docker_json(["image", "inspect", image, "--format", "{{json .Config}}"])
     labels = config.get("Labels") or {}
     missing = [k for k, v in IMAGE_LABELS.items() if labels.get(k) != v]
-    missing += [k for k in ("org.opencontainers.image.version", "org.opencontainers.image.description") if k not in labels]
+    if "org.opencontainers.image.description" not in labels:
+        missing.append("org.opencontainers.image.description")
+    actual_version_label = labels.get("org.opencontainers.image.version")
+    if actual_version_label != version:
+        missing.append(
+            f"org.opencontainers.image.version (expected {version!r}, got {actual_version_label!r})"
+        )
     if missing:
-        return CheckResult(CAT_IMAGE, "expected OCI labels present", False, f"missing/mismatched: {missing}")
-    return CheckResult(CAT_IMAGE, "expected OCI labels present", True, f"{sorted(labels.keys())}")
+        return CheckResult(
+            CAT_IMAGE, "expected OCI labels present and version matches VERSION", False,
+            f"missing/mismatched: {missing}",
+        )
+    return CheckResult(
+        CAT_IMAGE, "expected OCI labels present and version matches VERSION", True,
+        f"{sorted(labels.keys())}, version={actual_version_label}",
+    )
 
 
 FORBIDDEN_REPO_FILES = {".git", ".claude", ".github", "tests", "docs", "README.md", "scripts", "compose.yaml", ".dockerignore"}
@@ -352,6 +377,56 @@ def check_kernel_readonly_write_fails(container_name: str, port: int) -> CheckRe
     return CheckResult(CAT_KERNEL, "attempted write to read-only rootfs fails, service keeps serving", passed, detail)
 
 
+def check_kernel_pid1_identity(container_name: str) -> CheckResult:
+    result = run_docker(["exec", container_name, "cat", "/proc/1/cmdline"])
+    if result.returncode != 0:
+        return CheckResult(CAT_KERNEL, "PID 1 process identity is python3 -m app", False, result.stderr.strip())
+    cmdline = [part for part in result.stdout.split("\x00") if part]
+    expected = ["python3", "-m", "app"]
+    return CheckResult(
+        CAT_KERNEL, "PID 1 process identity is python3 -m app", cmdline == expected, repr(cmdline)
+    )
+
+
+DOCKER_STOP_GRACE_SECONDS = 10
+
+
+def check_lifecycle_docker_stop(container_name: str) -> CheckResult:
+    """Automated regression protection for Day 1 finding M-2.
+
+    Prior to this check, every script in this repository only ever
+    force-removed its containers (`docker rm -f`, SIGKILL-equivalent), so
+    a broken `signal.signal(SIGTERM, ...)` registration in app/server.py
+    would have produced zero automated test failures anywhere - the only
+    symptom would have been a silent fallback to Docker's full 10s grace
+    period before SIGKILL, discoverable only by a human manually timing
+    `docker stop`. This issues a real `docker stop` (real SIGTERM,
+    bounded grace period) against the real running container and asserts
+    a clean, fast exit. Must run last among checks that need the
+    container running - it stops it.
+    """
+    started = time.monotonic()
+    stop_result = run_docker(
+        ["stop", "--time", str(DOCKER_STOP_GRACE_SECONDS), container_name],
+        timeout=DOCKER_STOP_GRACE_SECONDS + 5.0,
+    )
+    elapsed = time.monotonic() - started
+    if stop_result.returncode != 0:
+        return CheckResult(
+            CAT_RUNTIME, "docker stop exits cleanly within the grace period (exit code 0)",
+            False, stop_result.stderr.strip(),
+        )
+
+    state = docker_json(["inspect", container_name, "--format", "{{json .State}}"])
+    exit_code = state.get("ExitCode")
+    status = state.get("Status")
+    passed = exit_code == 0 and status == "exited" and elapsed < DOCKER_STOP_GRACE_SECONDS
+    detail = f"exit_code={exit_code} status={status} elapsed={elapsed:.2f}s (grace={DOCKER_STOP_GRACE_SECONDS}s)"
+    return CheckResult(
+        CAT_RUNTIME, "docker stop exits cleanly within the grace period (exit code 0)", passed, detail
+    )
+
+
 # --- orchestration --------------------------------------------------------
 
 
@@ -415,7 +490,7 @@ def main() -> int:
     results.append(check_source_healthcheck_declared())
     results.append(check_image_user(image))
     results.append(check_image_healthcheck(image))
-    results.append(check_image_labels(image))
+    results.append(check_image_labels(image, version))
     results.append(regression_prove_recursive_detection())
 
     try:
@@ -441,6 +516,11 @@ def main() -> int:
         results.append(check_kernel_capabilities_effective(container_name))
         results.append(check_kernel_no_new_privs(container_name))
         results.append(check_kernel_readonly_write_fails(container_name, port))
+        results.append(check_kernel_pid1_identity(container_name))
+
+        # Must run last: stops the container, so no check needing it
+        # running can come after this one.
+        results.append(check_lifecycle_docker_stop(container_name))
 
     finally:
         cleanup(container_name)

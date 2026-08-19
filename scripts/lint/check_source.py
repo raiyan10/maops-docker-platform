@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Project-specific source validator for the app/ package.
+"""Project-specific source validator for the app/ and gateway/ packages.
 
 SCOPE (read this before trusting the result): this is a small, deliberately
 narrow AST-based check for a short, explicit list of constructs that would
-be inappropriate in this project's tiny stdlib HTTP workload. It is **not**
-a general-purpose static security scanner, does not understand data flow,
-and does not replace a real tool (e.g. Bandit, Semgrep) for a larger
-codebase. It only scans `app/` — the actual runtime application source —
-never `scripts/` (which legitimately uses `subprocess` to drive Docker) or
-`tests/`.
+be inappropriate in this project's tiny stdlib HTTP workload/gateway. It is
+**not** a general-purpose static security scanner, does not understand data
+flow, and does not replace a real tool (e.g. Bandit, Semgrep) for a larger
+codebase. It only scans `app/` and `gateway/` — the actual runtime
+application and gateway source — never `scripts/` (which legitimately uses
+`subprocess` to drive Docker) or `tests/`.
+
+Legitimate stdlib HTTP networking (`http.client`, `socket`, `urllib.parse`)
+is never flagged — the gateway's whole job is making real, bounded
+outbound HTTP calls to a fixed configured upstream. What remains forbidden
+is shell/process execution and other constructs no honest HTTP
+client/server needs.
 
 Checks performed, each via the `ast` module (never naive substring
 matching, so e.g. a string literal or a comment mentioning "eval" never
@@ -94,11 +100,17 @@ def check_file(path: Path) -> list[Finding]:
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent.parent
-    app_dir = repo_root / "app"
+    scan_dirs = [repo_root / "app", repo_root / "gateway"]
 
-    files = sorted(app_dir.rglob("*.py"))
+    files: list[Path] = []
+    for scan_dir in scan_dirs:
+        if not scan_dir.exists():
+            print(f"no such directory: {scan_dir}", file=sys.stderr)
+            return 1
+        files.extend(sorted(scan_dir.rglob("*.py")))
+
     if not files:
-        print(f"no Python files found under {app_dir}", file=sys.stderr)
+        print(f"no Python files found under {scan_dirs}", file=sys.stderr)
         return 1
 
     all_findings: list[Finding] = []
@@ -111,7 +123,7 @@ def main() -> int:
             print(f"  {finding}")
         return 1
 
-    print(f"check_source.py: OK ({len(files)} file(s) scanned under app/)")
+    print(f"check_source.py: OK ({len(files)} file(s) scanned under app/, gateway/)")
     return 0
 
 

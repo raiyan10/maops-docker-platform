@@ -1,8 +1,9 @@
-"""Stdlib-only Docker HEALTHCHECK probe. No curl/wget dependency.
+"""Stdlib-only Docker HEALTHCHECK probe for the gateway service. No curl/wget.
 
-Connects to the app's own /healthz endpoint over loopback and exits 0 only
-on an HTTP 200 with the expected JSON body. Uses http.client (not
-urllib.request) to avoid any proxy-environment-variable interference.
+Connects to the gateway's own /healthz endpoint over loopback - liveness
+only, never the upstream app - and exits 0 only on an HTTP 200 with the
+expected JSON body. Uses http.client (not urllib.request) to avoid any
+proxy-environment-variable interference.
 """
 
 from __future__ import annotations
@@ -11,14 +12,14 @@ import http.client
 import json
 import sys
 
-from app.config import DEFAULT_PORT, load_config
+from gateway.config import DEFAULT_GATEWAY_PORT, load_config
 
 TIMEOUT_SECONDS = 2.0
 
 
 def check() -> bool:
     config = load_config()
-    port = config.port if config.port else DEFAULT_PORT
+    port = config.port if config.port else DEFAULT_GATEWAY_PORT
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=TIMEOUT_SECONDS)
     try:
         try:

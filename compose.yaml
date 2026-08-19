@@ -1,15 +1,26 @@
-# Day 1 baseline: exactly one application service. Deliberately kept
-# simple so it can grow through Day 2+ (see docs/roadmap.md) without
-# needing a structural rewrite.
+# Day 2 baseline: exactly two Compose-managed services. `gateway` is the
+# sole host-published service; `app` (the Day 1 backend) is reachable only
+# from inside the Compose project network, by Compose service-name
+# discovery (`app`), never a hardcoded container IP. See
+# docs/compose-platform.md for the full topology rationale. Deliberately
+# no custom network, named volume, secret, or Compose config is declared
+# yet (see docs/roadmap.md for Day 3+) -- the Compose default project
+# network is used intentionally.
+#
+# No `container_name:` is set for either service (unlike Day 1's single
+# service) so that scripts/compose/compose_integration.py can bring up
+# multiple isolated stacks under distinct `-p <project>` names without a
+# fixed-name collision; Compose's own `${project}-<service>-1` naming is
+# unique per project.
 services:
   app:
     build:
       context: .
       dockerfile: docker/app/Dockerfile
-    image: maops-docker-platform:0.1.0
-    container_name: maops-docker-platform-app
-    ports:
-      - "8080:8080"
+      args:
+        VERSION: ${VERSION:-0.2.0}
+    image: maops-docker-platform:${VERSION:-0.2.0}
+    command: ["-m", "app"]
     environment:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8080"
@@ -25,3 +36,38 @@ services:
       timeout: 3s
       start_period: 5s
       retries: 3
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+      args:
+        VERSION: ${VERSION:-0.2.0}
+    image: maops-docker-platform:${VERSION:-0.2.0}
+    command: ["-m", "gateway"]
+    # Sole host-published service, and only on loopback -- never a public
+    # 0.0.0.0 bind. GATEWAY_HOST_PORT lets an automated harness (or a
+    # developer avoiding a local port conflict) choose the host-side port
+    # without editing this file; it defaults to 8080 for everyday
+    # `docker compose up -d` use.
+    ports:
+      - "127.0.0.1:${GATEWAY_HOST_PORT:-8080}:8080"
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "8080"
+      UPSTREAM_HOST: "app"
+      UPSTREAM_PORT: "8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-m", "gateway.healthcheck"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    depends_on:
+      app:
+        condition: service_healthy

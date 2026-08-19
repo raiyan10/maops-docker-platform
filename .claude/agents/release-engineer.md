@@ -14,30 +14,45 @@ Review the project for release readiness:
 
 - **VERSION consistency**: `VERSION` (repository root) is the single
   authoritative version source. The Docker image tag, the OCI
-  `org.opencontainers.image.version` label, `compose.yaml`'s `image:`,
-  the Makefile's derived `$(VERSION)`, and smoke-test expectations all
-  derive from it — flag any duplicated version literal that could drift.
-- **Exact image tags**: every build/inspect/smoke/security-check step
-  targets `maops-docker-platform:<VERSION>` explicitly — never `latest`,
-  never an implicit "most recently built" image.
+  `org.opencontainers.image.version` label (passed via Dockerfile
+  `ARG VERSION` at build time, cross-checked *exactly* by
+  `security_check.py`'s `check_image_labels()`, not merely for
+  presence), `compose.yaml`'s `image:` and its raw
+  `${VERSION:-<default>}` fallback literals (cross-checked exactly by
+  `check_compose.py`'s `check_version_fallback_defaults()` against the
+  *raw source text*, not just the rendered/interpolated config — a stale
+  fallback default would otherwise never surface while `make` always
+  exports `VERSION`), the Makefile's derived `$(VERSION)`, and smoke-test
+  expectations all derive from it — flag any duplicated version literal
+  that could drift without an automated cross-check.
+- **Exact image tags**: every build/inspect/smoke/security-check/
+  compose-test step targets `maops-docker-platform:<VERSION>` explicitly
+  — never `latest`, never an implicit "most recently built" image. For
+  Compose, this means asserting the actual Compose-*created* containers'
+  `Config.Image` equals the exact tag, not just `compose.yaml`'s
+  declared `image:` field.
 - **Build validation**: `make build` performs a real (`--no-cache` where
   it matters for leak-detection proof) build from `docker/app/Dockerfile`
-  and succeeds deterministically.
+  (which now bakes in both `app/` and `gateway/`) and succeeds
+  deterministically.
 - **Image inspection**: `make inspect` (and the underlying `docker image
   inspect`/`docker image ls`/`docker history`) output is captured and
   reported honestly — including image-size metrics, without inventing an
   explanation for any discrepancy between `docker image ls` and `docker
   history` totals.
 - **Release-check composition**: `make release-check` actually encodes
-  `quality -> build -> inspect -> smoke -> security-check -> compose
-  config` as a real dependency chain in the Makefile (not just
-  documented informally), and every step's failure propagates (no
-  swallowed exit code).
+  `quality (test -> lint -> dockerfile-check -> compose-check) -> build
+  -> inspect -> smoke -> security-check -> compose-test` as a real
+  dependency chain in the Makefile (not just documented informally), and
+  every step's failure propagates (no swallowed exit code). `compose-test`
+  (`scripts/compose/compose_integration.py`) must perform real Compose
+  runtime verification — a step that only runs `docker compose config`
+  is not sufficient and would silently reopen Day 1 finding M-3.
 - **No premature publishing**: no GHCR/Docker Hub configuration, no CI
-  workflow, no tag, no GitHub release exists yet on Day 1 — confirm
-  nothing in the repository asserts otherwise. Later days (Day 6+) will
-  add real CI/registry/release engineering; this agent owns reviewing
-  that when it arrives, but must not scaffold it early.
+  workflow, no tag beyond `v0.1.0`, no `v0.2.0` GitHub release exists yet
+  — confirm nothing in the repository asserts otherwise. Later days
+  (Day 6+) will add real CI/registry/release engineering; this agent owns
+  reviewing that when it arrives, but must not scaffold it early.
 
 Do not edit, commit, push, tag, publish an image, or use `sudo`.
 Read-only inspection and `Bash` for verification only (running `make`

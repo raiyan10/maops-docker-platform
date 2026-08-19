@@ -10,10 +10,17 @@ the raw file, so a comment or a string value can't trivially satisfy a
 check that is meant to apply to a real instruction.
 
 Checks:
-  * FROM is digest-pinned (`image:tag@sha256:...`), never `:latest`, and
-    matches this project's base-image policy (`python:*-slim`).
+  * FROM is digest-pinned (`image:tag@sha256:<64 hex chars>` - validated as
+    an actual well-formed sha256 digest, not just `@sha256:` substring
+    presence), never `:latest`, and matches this project's base-image
+    policy (`python:*-slim`).
   * The final USER is non-root and matches the expected 10001:10001 intent.
-  * A HEALTHCHECK instruction exists and is not `NONE`.
+  * A HEALTHCHECK instruction exists, is not `NONE`, and its CMD is
+    exactly the required `["python3", "-m", "app.healthcheck"]` invocation
+    - a regression to the bare-script form (`python3 app/healthcheck.py`,
+    which breaks because `/app` isn't on `sys.path` for a bare script)
+    fails this check rather than only failing at Compose-health-status
+    time.
   * No `sudo` anywhere.
   * No remote `ADD` (a URL as the source).
   * No obviously secret-bearing ARG/ENV variable names.
@@ -25,6 +32,7 @@ Checks:
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -35,6 +43,9 @@ SECRET_NAME_PATTERN = re.compile(
 )
 PRIVILEGED_PATTERN = re.compile(r"--privileged|setuid|setcap", re.IGNORECASE)
 SUDO_PATTERN = re.compile(r"\bsudo\b", re.IGNORECASE)
+DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+HEALTHCHECK_CMD_PATTERN = re.compile(r"\bCMD\s+(\[.*\])\s*$")
+REQUIRED_HEALTHCHECK_CMD = ["python3", "-m", "app.healthcheck"]
 
 
 class Finding:
@@ -88,8 +99,18 @@ def check_from(instructions: list[tuple[int, str, str]]) -> list[Finding]:
     line_no, rest = from_lines[-1]
     image_ref = rest.split()[0]
 
-    if "@sha256:" not in image_ref:
+    if "@" not in image_ref:
         findings.append(Finding(line_no, f"FROM is not digest-pinned: {image_ref}"))
+    else:
+        digest_part = image_ref.split("@", 1)[1]
+        if not DIGEST_PATTERN.match(digest_part):
+            findings.append(
+                Finding(
+                    line_no,
+                    f"FROM digest is not a well-formed sha256 digest "
+                    f"(expected sha256: followed by 64 hex characters): {digest_part}",
+                )
+            )
     if ":latest" in image_ref or (
         "@" not in image_ref and ":" not in image_ref.split("/")[-1]
     ):
@@ -132,6 +153,28 @@ def check_healthcheck(instructions: list[tuple[int, str, str]]) -> list[Finding]
     line_no, rest = healthchecks[-1]
     if rest.strip().upper() == "NONE":
         return [Finding(line_no, "HEALTHCHECK is explicitly disabled (NONE)")]
+
+    match = HEALTHCHECK_CMD_PATTERN.search(rest)
+    if not match:
+        return [
+            Finding(
+                line_no,
+                f"HEALTHCHECK does not use a CMD [...] exec-form array: {rest}",
+            )
+        ]
+    try:
+        cmd = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return [Finding(line_no, f"HEALTHCHECK CMD is not valid JSON: {match.group(1)}")]
+    if cmd != REQUIRED_HEALTHCHECK_CMD:
+        return [
+            Finding(
+                line_no,
+                f"HEALTHCHECK CMD must be exactly {REQUIRED_HEALTHCHECK_CMD}, got {cmd} "
+                f"(a bare-script invocation like ['python3', 'app/healthcheck.py'] breaks "
+                f"because /app is not on sys.path outside package-module form)",
+            )
+        ]
     return []
 
 

@@ -1,9 +1,10 @@
 import http.client
 import json
+import socket
 import threading
 import unittest
 
-from app.config import AppConfig
+from app.config import AppConfig, load_config
 from app.server import build_server
 from app.version import get_version
 
@@ -117,9 +118,57 @@ class UnsupportedMethodTests(ServerTestCase):
         response = self._request("DELETE", "/info")
         self.assertEqual(response.status, 405)
 
+    def test_patch_to_known_path_returns_405(self) -> None:
+        response = self._request("PATCH", "/healthz")
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.getheader("Allow"), "GET, HEAD")
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertIn("error", payload)
+
     def test_post_to_unknown_path_returns_404_not_405(self) -> None:
         response = self._request("POST", "/does-not-exist")
         self.assertEqual(response.status, 404)
+
+
+class EndToEndConfigurationTests(unittest.TestCase):
+    """Composes load_config() output into build_server() end-to-end (closes L-4)."""
+
+    def test_custom_host_and_port_from_env_actually_bind(self) -> None:
+        # APP_PORT=0 would be rejected by load_config()'s own validation
+        # (MIN_PORT=1), so a free port is obtained via a real bind/close
+        # probe instead, to exercise a genuine env-driven, non-default
+        # port value end-to-end.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+        probe.close()
+
+        config = load_config(
+            env={"APP_HOST": "127.0.0.1", "APP_PORT": str(free_port), "APP_NAME": "e2e-app"}
+        )
+        server = build_server(config)
+        try:
+            bound_host, bound_port = server.server_address
+            self.assertEqual(bound_host, "127.0.0.1")
+            self.assertEqual(bound_port, free_port)
+
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", bound_port, timeout=5)
+                try:
+                    conn.request("GET", "/")
+                    response = conn.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["service"], "e2e-app")
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+        finally:
+            server.server_close()
 
 
 class NoTracebackDisclosureTests(ServerTestCase):
