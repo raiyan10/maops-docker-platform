@@ -26,7 +26,17 @@ Review the image and runtime configuration for:
   `/proc/1/status` `NoNewPrivs` field.
 - **Read-only root filesystem**: `read_only: true` is requested, and an
   actual attempted write inside the running container fails while the
-  service keeps serving — not merely a source-config assertion.
+  service keeps serving — not merely a source-config assertion. `state`
+  is the one service with a writable path (`/data`, via the `state_data`
+  named volume) — verify this is proven as an *addition* alongside the
+  rootfs-write-rejection proof (a real write to `/data` succeeds, a real
+  write to a protected rootfs path still fails on the same container),
+  never as a substitute for it, and never by weakening `read_only: true`
+  itself.
+- **Compose-mounted config read-only**: `config/platform.json` (mounted
+  at `/etc/maops/platform.json` in `app`/`gateway`/`state`) is read-only
+  both at [C] (`docker inspect` `Mounts[].RW == false`) and [D] (a real
+  attempted write to it is rejected).
 - **Namespaces**: no host PID namespace, no host network namespace, no
   `--privileged`.
 - **Mounts**: no Docker socket mount, no host filesystem bind mount into

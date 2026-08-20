@@ -15,7 +15,6 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from unittest.mock import patch
 
 from gateway import server as gateway_server
 from gateway.config import GatewayConfig
@@ -55,6 +54,9 @@ class _FakeUpstreamHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._serve(write_body=True)
 
+    def do_POST(self) -> None:
+        self._serve(write_body=True)
+
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass
 
@@ -82,6 +84,7 @@ class GatewayTestCase(unittest.TestCase):
     upstream_responses: dict = {}
     upstream_delay_seconds: float = 0.0
     use_fake_upstream: bool = True
+    upstream_timeout_seconds: float = 3.0
 
     def setUp(self) -> None:
         if self.use_fake_upstream:
@@ -101,6 +104,7 @@ class GatewayTestCase(unittest.TestCase):
             port=0,
             upstream_host=upstream_host,
             upstream_port=upstream_port,
+            upstream_timeout_seconds=self.upstream_timeout_seconds,
             name="test-gateway",
         )
         self.gateway_server = gateway_server.build_server(config)
@@ -258,21 +262,15 @@ class UpstreamInfoNonStatus200Tests(GatewayTestCase):
 
 
 class UpstreamTimeoutTests(GatewayTestCase):
-    """Upstream deliberately never responds in time; UPSTREAM_TIMEOUT_SECONDS
-    is patched small so this test stays fast rather than waiting out the
-    real 3s production timeout."""
+    """Upstream deliberately never responds in time; the gateway's own
+    configured upstream_timeout_seconds is set small (via GatewayConfig,
+    not a module-level constant - the timeout is a per-config value as of
+    Day 3, sourced from the mounted platform config) so this test stays
+    fast rather than waiting out the real 3s production default."""
 
     upstream_responses = {"/readyz": json_response(200, {"status": "ready"})}
     upstream_delay_seconds = 0.5
-
-    def setUp(self) -> None:
-        self._timeout_patch = patch.object(gateway_server, "UPSTREAM_TIMEOUT_SECONDS", 0.1)
-        self._timeout_patch.start()
-        super().setUp()
-
-    def tearDown(self) -> None:
-        super().tearDown()
-        self._timeout_patch.stop()
+    upstream_timeout_seconds = 0.1
 
     def test_upstream_timeout_converts_to_controlled_503(self) -> None:
         response = self._request("GET", "/readyz")
@@ -281,6 +279,53 @@ class UpstreamTimeoutTests(GatewayTestCase):
         self.assertEqual(payload.get("status"), "not-ready")
         body_text = response.read_body.decode("utf-8")  # type: ignore[attr-defined]
         self.assertNotIn("Traceback", body_text)
+
+
+class StateGetForwardingTests(GatewayTestCase):
+    upstream_responses = {"/state": json_response(200, {"value": 3})}
+
+    def test_state_get_forwards_upstream_payload_unchanged(self) -> None:
+        response = self._request("GET", "/state")
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertEqual(payload, {"value": 3})
+
+
+class StateGetUnavailableTests(GatewayTestCase):
+    use_fake_upstream = False
+
+    def test_state_get_returns_controlled_503_when_upstream_unreachable(self) -> None:
+        response = self._request("GET", "/state")
+        self.assertEqual(response.status, 503)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertIn("error", payload)
+        body_text = response.read_body.decode("utf-8")  # type: ignore[attr-defined]
+        self.assertNotIn("Traceback", body_text)
+
+
+class StateIncrementForwardingTests(GatewayTestCase):
+    upstream_responses = {"/state/increment": json_response(200, {"value": 4})}
+
+    def test_state_increment_forwards_as_a_real_post(self) -> None:
+        response = self._request("POST", "/state/increment")
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertEqual(payload, {"value": 4})
+
+    def test_state_increment_get_is_405(self) -> None:
+        response = self._request("GET", "/state/increment")
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.getheader("Allow"), "POST")
+
+
+class StateIncrementUnavailableTests(GatewayTestCase):
+    use_fake_upstream = False
+
+    def test_state_increment_returns_controlled_503_when_upstream_unreachable(self) -> None:
+        response = self._request("POST", "/state/increment")
+        self.assertEqual(response.status, 503)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertIn("error", payload)
 
 
 class NotFoundTests(GatewayTestCase):
@@ -323,6 +368,11 @@ class UnsupportedMethodTests(GatewayTestCase):
     def test_post_to_unknown_path_returns_404_not_405(self) -> None:
         response = self._request("POST", "/does-not-exist")
         self.assertEqual(response.status, 404)
+
+    def test_post_to_state_returns_405(self) -> None:
+        response = self._request("POST", "/state")
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.getheader("Allow"), "GET, HEAD")
 
 
 class NoTracebackDisclosureTests(GatewayTestCase):

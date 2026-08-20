@@ -16,7 +16,7 @@ FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b
 ARG VERSION=0.0.0-unset
 
 LABEL org.opencontainers.image.title="maops-docker-platform" \
-      org.opencontainers.image.description="Secure Python stdlib HTTP platform demonstrating Docker/Compose container engineering practices (app + gateway services)" \
+      org.opencontainers.image.description="Secure Python stdlib HTTP platform demonstrating Docker/Compose container engineering practices (app + gateway + state services)" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/raiyan10/maops-docker-platform"
@@ -36,7 +36,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY --chown=10001:10001 app/ ./app/
 COPY --chown=10001:10001 gateway/ ./gateway/
+COPY --chown=10001:10001 state/ ./state/
 COPY --chown=10001:10001 VERSION ./VERSION
+
+# /data is the state role's fixed persisted-volume mount point (see
+# compose.yaml's `state_data` named volume). Docker populates a *new*,
+# empty named volume from whatever already exists at its target path in
+# the image at container-create time - so the directory must already
+# exist here, owned by the same non-root 10001:10001 user the process
+# runs as, or the state process would be unable to write into a freshly
+# created volume without running as root or a post-hoc `chmod`/init
+# container. app and gateway never write anywhere, so they get no such
+# directory.
+RUN mkdir -p /data && chown 10001:10001 /data
 
 USER 10001:10001
 
@@ -44,16 +56,17 @@ EXPOSE 8080
 
 # Stdlib-only probe (no curl/wget installed merely for HEALTHCHECK). This
 # is the image-level default for the `app` role; compose.yaml overrides
-# `healthcheck:` for the `gateway` role with `python3 -m
-# gateway.healthcheck` instead, since a single image can only declare one
-# HEALTHCHECK and the two roles probe different endpoints.
+# `healthcheck:` for the `gateway` role (`python3 -m gateway.healthcheck`)
+# and the `state` role (`python3 -m state.healthcheck`), since a single
+# image can only declare one HEALTHCHECK and each role probes its own
+# endpoint.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["python3", "-m", "app.healthcheck"]
 
-# One image, two roles: ENTRYPOINT stays a bare interpreter (exec form,
+# One image, three roles: ENTRYPOINT stays a bare interpreter (exec form,
 # still PID 1 directly - no shell wrapper) and CMD selects the default
-# module. compose.yaml overrides `command: ["-m", "gateway"]` for the
-# gateway service; the app service's `command: ["-m", "app"]` is explicit
-# too, matching this default.
+# module. compose.yaml overrides `command: ["-m", "gateway"]` /
+# `command: ["-m", "state"]` for those services; the app service's
+# `command: ["-m", "app"]` is explicit too, matching this default.
 ENTRYPOINT ["python3"]
 CMD ["-m", "app"]

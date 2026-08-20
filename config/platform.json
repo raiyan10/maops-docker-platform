@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "platform_name": "maops-docker-platform",
+  "dependency_timeout_seconds": 3.0,
+  "state_filename": "state.json"
+}

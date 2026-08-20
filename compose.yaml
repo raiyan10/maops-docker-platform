@@ -1,30 +1,85 @@
-# Day 2 baseline: exactly two Compose-managed services. `gateway` is the
-# sole host-published service; `app` (the Day 1 backend) is reachable only
-# from inside the Compose project network, by Compose service-name
-# discovery (`app`), never a hardcoded container IP. See
-# docs/compose-platform.md for the full topology rationale. Deliberately
-# no custom network, named volume, secret, or Compose config is declared
-# yet (see docs/roadmap.md for Day 3+) -- the Compose default project
-# network is used intentionally.
+# Day 3 baseline: three Compose-managed services across two explicit
+# networks, one named persistent volume, and one Compose config object.
 #
-# No `container_name:` is set for either service (unlike Day 1's single
-# service) so that scripts/compose/compose_integration.py can bring up
-# multiple isolated stacks under distinct `-p <project>` names without a
-# fixed-name collision; Compose's own `${project}-<service>-1` naming is
-# unique per project.
+# Topology: host -> gateway -> app -> state.
+#   - `edge`    : gateway <-> app only.
+#   - `backend` : app <-> state only, `internal: true` (no default route
+#                 to the outside world, and Docker refuses to attach a
+#                 host-published port to a service reachable only via an
+#                 internal network).
+#   - `gateway` and `state` share NO network - this is what makes
+#     gateway -> state unresolvable/unreachable, not merely undeclared.
+# See docs/networking.md for the full topology rationale and the runtime
+# proof that this is real segmentation, not just two network names.
+#
+# Persistence: `state` is the only service with a volume mount
+# (`state_data:/data`) and keeps `read_only: true` on its own rootfs -
+# only /data is writable, via the named volume, never the container
+# filesystem itself. See docs/persistence.md.
+#
+# Configuration: all three services mount the same non-secret
+# `config/platform.json` read-only via the top-level `configs:` object
+# (Compose-native config injection, distinct from `environment:` and from
+# a Compose `secrets:` block, which this platform still has no need for -
+# see docs/configuration.md).
+#
+# No `container_name:` is set for any service (unchanged from Day 2) so
+# that scripts/compose/compose_integration.py can bring up multiple
+# isolated stacks under distinct `-p <project>` names without a
+# fixed-name collision.
 services:
+  state:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+      args:
+        VERSION: ${VERSION:-0.3.0}
+    image: maops-docker-platform:${VERSION:-0.3.0}
+    command: ["-m", "state"]
+    environment:
+      STATE_HOST: "0.0.0.0"
+      STATE_PORT: "8080"
+    networks:
+      - backend
+    volumes:
+      - type: volume
+        source: state_data
+        target: /data
+    configs:
+      - source: platform
+        target: /etc/maops/platform.json
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-m", "state.healthcheck"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
   app:
     build:
       context: .
       dockerfile: docker/app/Dockerfile
       args:
-        VERSION: ${VERSION:-0.2.0}
-    image: maops-docker-platform:${VERSION:-0.2.0}
+        VERSION: ${VERSION:-0.3.0}
+    image: maops-docker-platform:${VERSION:-0.3.0}
     command: ["-m", "app"]
     environment:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8080"
       APP_NAME: "maops-docker-platform"
+      STATE_HOST: "state"
+      STATE_PORT: "8080"
+    networks:
+      - edge
+      - backend
+    configs:
+      - source: platform
+        target: /etc/maops/platform.json
     read_only: true
     cap_drop:
       - ALL
@@ -36,14 +91,17 @@ services:
       timeout: 3s
       start_period: 5s
       retries: 3
+    depends_on:
+      state:
+        condition: service_healthy
 
   gateway:
     build:
       context: .
       dockerfile: docker/app/Dockerfile
       args:
-        VERSION: ${VERSION:-0.2.0}
-    image: maops-docker-platform:${VERSION:-0.2.0}
+        VERSION: ${VERSION:-0.3.0}
+    image: maops-docker-platform:${VERSION:-0.3.0}
     command: ["-m", "gateway"]
     # Sole host-published service, and only on loopback -- never a public
     # 0.0.0.0 bind. GATEWAY_HOST_PORT lets an automated harness (or a
@@ -57,6 +115,11 @@ services:
       GATEWAY_PORT: "8080"
       UPSTREAM_HOST: "app"
       UPSTREAM_PORT: "8080"
+    networks:
+      - edge
+    configs:
+      - source: platform
+        target: /etc/maops/platform.json
     read_only: true
     cap_drop:
       - ALL
@@ -71,3 +134,15 @@ services:
     depends_on:
       app:
         condition: service_healthy
+
+networks:
+  edge: {}
+  backend:
+    internal: true
+
+volumes:
+  state_data: {}
+
+configs:
+  platform:
+    file: ./config/platform.json

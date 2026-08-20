@@ -33,8 +33,9 @@ Review the project for release readiness:
   declared `image:` field.
 - **Build validation**: `make build` performs a real (`--no-cache` where
   it matters for leak-detection proof) build from `docker/app/Dockerfile`
-  (which now bakes in both `app/` and `gateway/`) and succeeds
-  deterministically.
+  (which now bakes in `app/`, `gateway/`, and `state/`, plus a
+  pre-created, correctly-owned `/data` mount point for the `state_data`
+  named volume) and succeeds deterministically.
 - **Image inspection**: `make inspect` (and the underlying `docker image
   inspect`/`docker image ls`/`docker history`) output is captured and
   reported honestly — including image-size metrics, without inventing an
@@ -46,10 +47,15 @@ Review the project for release readiness:
   dependency chain in the Makefile (not just documented informally), and
   every step's failure propagates (no swallowed exit code). `compose-test`
   (`scripts/compose/compose_integration.py`) must perform real Compose
-  runtime verification — a step that only runs `docker compose config`
-  is not sufficient and would silently reopen Day 1 finding M-3.
+  runtime verification of all three services — a step that only runs
+  `docker compose config` is not sufficient and would silently reopen Day
+  1 finding M-3. `smoke` (`scripts/smoke/container_smoke.py`) still
+  exercises the `app` role via a bare `docker run` only, outside Compose —
+  verify its `/readyz` expectation is honestly scoped to that context
+  (`state` genuinely doesn't exist there, so a controlled 503 is the
+  correct isolated-container result, not a failure).
 - **No premature publishing**: no GHCR/Docker Hub configuration, no CI
-  workflow, no tag beyond `v0.1.0`, no `v0.2.0` GitHub release exists yet
+  workflow, no tag beyond `v0.2.0`, no `v0.3.0` GitHub release exists yet
   — confirm nothing in the repository asserts otherwise. Later days
   (Day 6+) will add real CI/registry/release engineering; this agent owns
   reviewing that when it arrives, but must not scaffold it early.

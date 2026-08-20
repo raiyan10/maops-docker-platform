@@ -52,7 +52,15 @@ coverage.
    `/healthz` afterward — a config check alone doesn't prove the write
    actually fails or that the app survives it. Clean up any probe path
    you create (though the read-only filesystem should reject it before
-   anything is written).
+   anything is written). `state` (Day 3) is the one service with a
+   writable path (`/data`, via the `state_data` named volume) — verify
+   the rootfs-write-rejection proof *still* holds for `state` (a write to
+   `/etc/...` still fails) in addition to, never instead of, a real write
+   to `/data` succeeding (`docker exec state sh -c 'echo x > /data/probe
+   && rm /data/probe'`). The same [C]/[D] pair applies to the
+   Compose-mounted `config/platform.json` (`/etc/maops/platform.json` in
+   every service): [C] `Mounts[].RW == false`, [D] a real write to it is
+   rejected.
 
 5. **Namespaces/mounts**: [C] `docker inspect <container> --format
    '{{.HostConfig.Privileged}}'` is `false`; `{{.HostConfig.PidMode}}`

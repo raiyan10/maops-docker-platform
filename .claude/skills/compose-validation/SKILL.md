@@ -5,23 +5,26 @@ description: Reusable docker compose config/start/inspect/functional/down/cleanu
 
 # Compose Validation
 
-Reusable Compose lifecycle procedure. As of Day 2 there are exactly two
-services (`app`, `gateway`); this same procedure is meant to extend — not
-be replaced — as later days add networks or volumes.
+Reusable Compose lifecycle procedure. As of Day 3 there are exactly three
+services (`state`, `app`, `gateway`) across two explicit networks (`edge`,
+`backend`), one named volume (`state_data`), and one Compose config
+object (`platform`); this same procedure is meant to extend — not be
+replaced — as later days add more.
 
 `make compose-check` (`scripts/compose/check_compose.py`) and `make
 compose-test` (`scripts/compose/compose_integration.py`) now automate
 most of this procedure end-to-end — `check_compose.py` covers step 1's
-structural invariants, `compose_integration.py` covers steps 2-6
-including the failure/recovery scenario. Use the manual steps below when
-investigating a specific failure, extending coverage, or cross-verifying
-the automated scripts' own claims.
+structural invariants, `compose_integration.py` covers steps 2-7
+including the network-isolation, startup-ordering, and persistence
+proofs. Use the manual steps below when investigating a specific failure,
+extending coverage, or cross-verifying the automated scripts' own claims.
 
 ## Procedure
 
 1. **Static validation** — confirm the file parses and resolves the way
-   you expect (both services present, image tag/version, env, port
-   mapping, hardening flags, healthchecks, `depends_on`):
+   you expect (all three services present, image tag/version, env, port
+   mapping, hardening flags, healthchecks, `depends_on` chain, network
+   membership, the named volume, the mounted config):
    ```bash
    docker compose config
    python3 scripts/compose/check_compose.py
@@ -33,78 +36,109 @@ the automated scripts' own claims.
    docker compose -p maops-compose-manual up -d
    ```
 
-3. **Wait for and confirm health of both services**, bounded (do not poll
-   forever):
+3. **Wait for and confirm health of all three services**, bounded (do not
+   poll forever), and check the ordering, not just the end state:
    ```bash
-   docker inspect maops-compose-manual-app-1 --format '{{.State.Health.Status}}'
-   docker inspect maops-compose-manual-gateway-1 --format '{{.State.Health.Status}}'
+   for c in state app gateway; do
+     docker inspect maops-compose-manual-$c-1 --format '{{.State.Health.Status}}'
+   done
+   docker inspect maops-compose-manual-state-1 --format '{{json (index .State.Health.Log 0).End}}'
+   docker inspect maops-compose-manual-app-1 --format '{{json .State.StartedAt}}'
+   # app's StartedAt should be >= state's first-healthy time; same for gateway vs. app
    ```
-   Poll each until `healthy` or a deadline is reached.
 
-4. **Verify effective runtime restrictions on *both* containers**, not
+4. **Verify effective runtime restrictions on *all three* containers**, not
    just that Compose *started* them — this is the same [C]/[D]
    distinction `container-security-validation` uses, and
    `compose_integration.py` automates it by directly reusing
    `security_check.py`'s own check functions rather than a separate
    implementation:
    ```bash
-   for c in maops-compose-manual-app-1 maops-compose-manual-gateway-1; do
+   for c in maops-compose-manual-state-1 maops-compose-manual-app-1 maops-compose-manual-gateway-1; do
      docker inspect "$c" --format \
        'ReadonlyRootfs={{.HostConfig.ReadonlyRootfs}} CapDrop={{.HostConfig.CapDrop}} SecurityOpt={{.HostConfig.SecurityOpt}}'
      docker exec "$c" id
      docker exec "$c" cat /proc/1/cmdline
+     docker exec "$c" sh -c 'echo x > /etc/maops-manual-probe' # must fail: read-only
    done
+   docker exec maops-compose-manual-state-1 sh -c 'echo x > /data/manual-probe && rm /data/manual-probe' # must succeed
    ```
 
-5. **Functional check through the gateway** — `app` has no published
-   port, so every check goes through `gateway`'s loopback port; find it
-   first, then actually call the service, don't just trust health status:
+5. **Network membership and isolation** — confirm real DNS resolution
+   succeeds along the intended path and fails across the isolation
+   boundary:
+   ```bash
+   docker exec maops-compose-manual-gateway-1 python3 -c "import socket; socket.gethostbyname('app')"     # succeeds
+   docker exec maops-compose-manual-app-1 python3 -c "import socket; socket.gethostbyname('state')"       # succeeds
+   docker exec maops-compose-manual-gateway-1 python3 -c "import socket; socket.gethostbyname('state')"   # must fail
+   docker exec maops-compose-manual-state-1 python3 -c "import socket; socket.gethostbyname('gateway')"   # must fail
+   ```
+
+6. **Functional check through the gateway** — `app`/`state` have no
+   published port, so every check goes through `gateway`'s loopback port;
+   find it first, then actually call the service, don't just trust health
+   status:
    ```bash
    docker port maops-compose-manual-gateway-1 8080/tcp
    python3 -c "
    import http.client, json
    conn = http.client.HTTPConnection('127.0.0.1', <mapped-port>, timeout=5)
-   for path in ('/', '/healthz', '/readyz', '/upstream/info'):
-       conn.request('GET', path)
+   for method, path in (('GET','/'), ('GET','/healthz'), ('GET','/readyz'), ('GET','/state'), ('POST','/state/increment')):
+       conn.request(method, path)
        r = conn.getresponse()
-       print(path, r.status, r.read())
+       print(method, path, r.status, r.read())
    "
    ```
-   Confirm `/upstream/info` actually reflects `app`'s real `/info`
-   response (proves gateway→app communication, not a canned value).
+   Confirm `/state`/`/state/increment` genuinely reflect a real,
+   persisted value through the full `gateway -> app -> state` chain, not
+   a canned response.
 
-6. **Failure/recovery scenario** — stop `app`, confirm `gateway`'s
-   process stays alive while its `/readyz` degrades to a controlled
-   `503`, then restart `app` and confirm `gateway` recovers:
+7. **Failure/recovery scenario** — stop `state`, confirm `app` and
+   `gateway` processes stay alive while `gateway`'s `/readyz` degrades to
+   a controlled `503`, then restart `state` and confirm recovery:
    ```bash
-   docker compose -p maops-compose-manual stop app
-   docker inspect maops-compose-manual-gateway-1 --format '{{.State.Running}}'   # must be true
-   # poll /readyz -> expect non-200 / {"status": "not-ready", ...}
-   docker compose -p maops-compose-manual start app
-   # wait for app healthy again, then poll /readyz -> expect 200 {"status": "ready"}
+   docker compose -p maops-compose-manual stop state
+   docker inspect maops-compose-manual-app-1 --format '{{.State.Running}}'      # must be true
+   docker inspect maops-compose-manual-gateway-1 --format '{{.State.Running}}'  # must be true
+   # poll gateway /readyz -> expect non-200 / {"status": "not-ready", ...}
+   docker compose -p maops-compose-manual start state
+   # wait for state healthy again, then poll gateway /readyz -> expect 200 {"status": "ready"}
    ```
 
-7. **Tear down and confirm cleanliness**:
+8. **Persistence across recreation** — recreate `state` alone (volume
+   retained) and confirm the value survived:
    ```bash
-   docker compose -p maops-compose-manual down
+   docker compose -p maops-compose-manual up -d --force-recreate --no-deps state
+   # re-poll GET /state through gateway -> same value as before recreation
+   ```
+
+9. **Tear down and confirm cleanliness** — include `-v` only for a test's
+   own uniquely named project, never for a normal development stack:
+   ```bash
+   docker compose -p maops-compose-manual down -v
    docker ps -a --filter "name=maops-compose-manual" --format '{{.Names}}'
    docker network ls --filter "name=maops-compose-manual" --format '{{.Name}}'
+   docker volume ls --filter "name=maops-compose-manual" --format '{{.Name}}'
    ```
-   Both filtered listings must be empty afterward — no leftover
-   container or network.
+   All three filtered listings must be empty afterward — no leftover
+   container, network, or volume.
 
-## Extending across Days 3-7
+## Extending across Days 4-7
 
-When a later day adds a network or volume:
+When a later day adds a resource limit, restart policy, or CI-driven
+verification:
 
-- Add its own health/functional check to steps 3-6 rather than only
-  checking `app`/`gateway`.
-- Keep the teardown-cleanliness check (step 7) covering every service
-  Compose now manages, not just the first two.
+- Add its own health/functional check to the relevant step above rather
+  than only checking `state`/`app`/`gateway`.
+- Keep the teardown-cleanliness check (step 9) covering every resource
+  Compose now manages, not just the current three services/two networks/
+  one volume/one config.
 - Never let further growth reintroduce `network_mode: host`, `pid: host`,
-  a Docker socket mount, or a host filesystem bind mount — the Day 1/2
-  hardening baseline in `compose.yaml` must survive every later day's
-  growth, not just the first review.
-- Keep `app` non-host-published unless a later day's scope explicitly
-  requires otherwise — `gateway` (or whatever becomes the edge service)
-  should remain the only host-facing surface.
+  a Docker socket mount, or an arbitrary host filesystem bind mount — the
+  Day 1-3 hardening baseline in `compose.yaml` must survive every later
+  day's growth, not just the first review.
+- Keep `app`/`state` non-host-published unless a later day's scope
+  explicitly requires otherwise — `gateway` (or whatever becomes the edge
+  service) should remain the only host-facing surface.
+- Never remove a persisted named volume except via that specific test
+  project's own `down -v` — no global `docker volume prune`, ever.

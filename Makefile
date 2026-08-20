@@ -75,8 +75,8 @@ clean:
 	@echo "removing any leftover maops-smoke-*/maops-security-* containers (self-cleaning scripts should leave none)"
 	@ids="$$(docker ps -aq --filter 'name=^maops-smoke-' --filter 'name=^maops-security-')"; \
 	if [ -n "$$ids" ]; then docker rm -f $$ids; else echo "none found"; fi
-	@echo "removing any leftover maops-compose-* Compose project resources (compose_integration.py's own teardown should leave none)"
-	@projects="$$(docker ps -a --filter 'name=^maops-compose-' --format '{{.Names}}' | sed -E 's/^(maops-compose-[a-f0-9]+)-(app|gateway)-1$$/\1/' | sort -u)"; \
+	@echo "removing any leftover maops-compose-* Compose project resources, including their own named volume (compose_integration.py's own teardown should leave none)"
+	@projects="$$(docker ps -a --filter 'name=^maops-compose-' --format '{{.Names}}' | sed -E 's/^(maops-compose-[a-f0-9]+)-(app|gateway|state)-1$$/\1/' | sort -u)"; \
 	if [ -n "$$projects" ]; then \
-		for p in $$projects; do docker compose -p "$$p" -f compose.yaml down -t 5 || true; done; \
+		for p in $$projects; do docker compose -p "$$p" -f compose.yaml down -t 5 -v || true; done; \
 	else echo "none found"; fi

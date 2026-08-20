@@ -18,16 +18,23 @@ and `scripts/compose/` for:
   process only, no fixed external ports (dynamic port via `port=0` and
   reading the bound address back), no shared mutable global state,
   environment modifications restored on cleanup, meaningful coverage of
-  both `app` (`/`, `/healthz`, `/readyz`, `/info`) and `gateway` (`/`,
-  `/healthz`, `/readyz` success/upstream-unavailable, `/upstream/info`
-  success/malformed/unreachable, upstream timeout conversion) endpoints —
-  JSON schema/Content-Type/HEAD/404/unsupported-method behavior for both
-  — and config validation edge cases for both `APP_*` and
-  `GATEWAY_*`/`UPSTREAM_*` (malformed, zero, negative, >65535,
-  whitespace). Gateway tests must never call the public internet — a real
-  loopback fake-upstream server (dynamic port) is required for
-  success/failure-path coverage, not a mock of `gateway.server`'s own
-  logic.
+  `app` (`/`, `/healthz`, `/readyz` now dependency-aware toward `state`,
+  `/info`, `/state`, `/state/increment`), `gateway` (`/`, `/healthz`,
+  `/readyz` success/upstream-unavailable, `/upstream/info`
+  success/malformed/unreachable, `/state`/`/state/increment` forwarding,
+  upstream timeout conversion), and `state` (`/`, `/healthz`, `/readyz`
+  storage-readiness, `GET /state`, `POST /state/increment`, malformed/
+  corrupted persisted state, atomic write behavior) — JSON schema/
+  Content-Type/HEAD/404/unsupported-method behavior for all three — and
+  config validation edge cases for `APP_*`/`STATE_*` (app's own),
+  `GATEWAY_*`/`UPSTREAM_*`, `STATE_*` (state's own), and each service's
+  `platform_config.py` (schema/type validation, malformed JSON, out-of-
+  range `dependency_timeout_seconds`, unsafe `state_filename`). No
+  service's tests may call the public internet — a real loopback
+  fake-upstream/fake-state server (dynamic port) is required for
+  success/failure-path coverage, not a mock of any service's own
+  dispatch logic. Persistence-layer tests (`state/storage.py`) must use a
+  temporary directory, never the real repository `/data` path.
 - **Smoke test quality**: exercises the *real* built image at the exact
   `VERSION`-derived tag (never `latest`), a unique container name per
   run, a dynamically chosen/mapped host port, a bounded wait deadline
@@ -44,15 +51,22 @@ and `scripts/compose/` for:
   merely presence.
 - **Compose test quality is now mandatory, not optional**:
   `scripts/compose/check_compose.py` (static, rendered-config structural
-  invariants) and `scripts/compose/compose_integration.py` (runtime: real
-  two-service stack, both containers' hardening/PID 1 proven via reused
-  `security_check.py` functions, gateway→app service-discovery proof,
-  app-stop/gateway-degrade and app-restart/gateway-recover scenario with
-  bounded deadlines) must both exist, both be wired into `make quality`/
-  `make release-check` respectively, and `compose_integration.py` must
-  inspect the *actual Compose-created* containers — a check that only
-  ever calls `docker compose config` is not sufficient (this is exactly
-  Day 1 finding M-3; verify it stays closed).
+  invariants, including network membership/isolation, the named volume,
+  the mounted config, and the `UPSTREAM_HOST`/`STATE_HOST`-vs-real-service
+  cross-check) and `scripts/compose/compose_integration.py` (runtime: real
+  three-service stack, every container's hardening/PID 1 proven via
+  reused `security_check.py` functions plus a real [D] rootfs-write-
+  rejection proof now performed against every Compose-managed container,
+  a genuine timestamp-based health-gated startup-ordering proof for both
+  links in the `state -> app -> gateway` chain, real network-isolation
+  proof via DNS-resolution-failure checks, state-stop/degrade and
+  state-start/recover scenario with bounded deadlines, and persistence
+  proof across container recreation and a full `compose down`/`up`
+  cycle) must both exist, both be wired into `make quality`/`make
+  release-check` respectively, and `compose_integration.py` must inspect
+  the *actual Compose-created* containers — a check that only ever calls
+  `docker compose config` is not sufficient (this is exactly Day 1
+  finding M-3; verify it stays closed, including its Day 3 extensions).
 - **Failure paths and cleanup**: every script that starts a
   container/Compose project cleans it up in a `finally` (or equivalent)
   on *both* success and failure, uses a unique/project-prefixed name

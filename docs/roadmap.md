@@ -1,6 +1,6 @@
 # Roadmap
 
-Seven-day portfolio arc. Only Days 1-2 are implemented; everything under
+Seven-day portfolio arc. Only Days 1-3 are implemented; everything under
 a later day below is **planned, not implemented** — do not read a later
 day's bullet list as describing current behavior.
 
@@ -90,11 +90,68 @@ day's bullet list as describing current behavior.
   reverse proxy, Compose secrets/configs, resource limits, or CI — all
   explicitly Day 3+ scope (see below).
 
-## Day 3 — Networking, configuration, volumes, persistence (planned)
+## Day 3 — Networking, configuration, volumes, persistence (v0.3.0, implemented)
 
-Compose-managed volumes, a real custom network topology (beyond Compose
-defaults), and configuration/persistence patterns appropriate to
-whatever Day 2 introduced.
+- A new `state/` package (stdlib-only, no third-party dependency, no
+  Flask/Redis/PostgreSQL/SQLite) added alongside `app/` and `gateway/` in
+  the same release image: `GET /`, `/healthz` (liveness only), `/readyz`
+  (a real, non-mutating storage-readiness check), `GET /state`, and
+  `POST /state/increment` — a durably persisted monotonic counter under a
+  fixed `/data` mount, with atomic fsync'd writes and strict corrupted-
+  state rejection (never silently coerced). See `docs/persistence.md`.
+- `compose.yaml` now declares exactly three services in a health-gated
+  chain: `state` (no dependency) -> `app` (`depends_on: state: condition:
+  service_healthy`) -> `gateway` (`depends_on: app: condition:
+  service_healthy`, unchanged from Day 2). `app` becomes the only service
+  allowed to talk to `state`; `gateway` forwards `GET /state`/`POST
+  /state/increment` to `app`'s identical paths, never to `state` directly.
+- Two explicit Compose networks replace the Day 2 implicit default:
+  `edge` (`gateway` + `app`) and `backend` (`app` + `state`,
+  `internal: true`). `gateway` and `state` share no network — proven at
+  runtime via real DNS-resolution-failure checks in both directions, not
+  merely declared. See `docs/networking.md`.
+- A named Compose volume (`state_data`, mounted at `/data` in `state`
+  only) provides real persistence across container recreation and a full
+  `compose down`/`up` cycle (volume retained) — proven, not asserted, by
+  `scripts/compose/compose_integration.py`. `state` keeps
+  `read_only: true` like every other service; `/data` is its only
+  writable path, proven at both [C] and [D] evidence tiers.
+  `docker/app/Dockerfile` pre-creates `/data` owned by `10001:10001` so a
+  freshly created volume works for the non-root process without running
+  as root or `chmod 777`.
+- A new top-level Compose `configs:` object (`config/platform.json`,
+  non-secret, mounted read-only into all three services at
+  `/etc/maops/platform.json`) demonstrates runtime configuration outside
+  the image — `dependency_timeout_seconds` (app's/gateway's bounded call
+  to their dependency) and `state_filename` (state's persisted-file name,
+  validated as a bare filename, never an arbitrary path) can change after
+  a container recreation with no image rebuild. See
+  `docs/configuration.md` for the full mechanism taxonomy (Compose
+  interpolation vs. environment vs. Compose-mounted config vs. secrets).
+- `scripts/compose/compose_integration.py` gained a genuine
+  timestamp-based health-gated startup-ordering proof (closes Day 2
+  finding M-1, day-02-compose-review.md: the prior script only polled
+  each container to eventually-healthy independently, never proving
+  `gateway` didn't start before `app` was actually healthy) and a real
+  [D] rejected-write proof for every Compose-managed container's rootfs
+  (closes Day 2 finding M-1/L-2, day-02-security-review.md /
+  day-02-compose-review.md: previously only asserted at [C]).
+- `scripts/compose/check_compose.py` gained a real cross-check that
+  `UPSTREAM_HOST`/`STATE_HOST` both name a real service in the compose
+  file *and* share a network with the consumer (closes Day 2 finding L-1,
+  day-02-compose-review.md), plus the full set of Day 3 network/volume/
+  config structural invariants.
+- `scripts/lint/check_source.py` now also scans `state/`, and closes the
+  carried-forward Day 1/2 finding (L-1, day-01/02-test-review.md) that
+  `os.system`/`os.popen` detection could be bypassed by a single-hop
+  import alias.
+- `VERSION` bumped `0.2.0` → `0.3.0`; the same version-consistency design
+  (image tag, OCI label, Compose image references, raw fallback literals)
+  extends to the three-service topology with no new duplicated version
+  literal.
+- Still no CPU/memory resource limits, restart-policy reliability
+  engineering, CI, or container registry — all explicitly Day 4+ scope
+  (see below).
 
 ## Day 4 — Build/image security and reproducibility (planned)
 

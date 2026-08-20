@@ -19,7 +19,14 @@ from app.server import build_server
 
 class HealthcheckTests(unittest.TestCase):
     def setUp(self) -> None:
-        config = AppConfig(host="127.0.0.1", port=0, name="healthcheck-test")
+        config = AppConfig(
+            host="127.0.0.1",
+            port=0,
+            name="healthcheck-test",
+            state_host="127.0.0.1",
+            state_port=1,
+            state_timeout_seconds=3.0,
+        )
         self.server = build_server(config)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

@@ -1,8 +1,12 @@
 """Deliberately small, explicit gateway configuration.
 
-Only four environment variables are read: GATEWAY_HOST, GATEWAY_PORT,
-UPSTREAM_HOST, UPSTREAM_PORT. No other environment variable is ever
-inspected or exposed by this module or by anything that consumes it.
+Four environment variables are read directly: GATEWAY_HOST, GATEWAY_PORT,
+UPSTREAM_HOST, UPSTREAM_PORT. A fifth, PLATFORM_CONFIG_PATH, is read only
+indirectly by platform_config.py to locate the mounted, non-secret
+platform config file (default /etc/maops/platform.json) - it never
+carries configuration *values* itself, only an optional path override. No
+other environment variable is ever inspected or exposed by this module or
+by anything that consumes it.
 
 UPSTREAM_HOST/UPSTREAM_PORT are the *only* destination the gateway will
 ever connect to (see server.py) - they are fixed at process startup from
@@ -15,7 +19,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
+
+from gateway.platform_config import load_platform_config
 
 DEFAULT_GATEWAY_HOST = "0.0.0.0"
 DEFAULT_GATEWAY_PORT = 8080
@@ -26,11 +33,12 @@ DEFAULT_NAME = "maops-docker-platform-gateway"
 MIN_PORT = 1
 MAX_PORT = 65535
 
-# Bounded so the gateway can never hang indefinitely waiting on the
-# backend. http.client.HTTPConnection applies a single socket-level
-# timeout to both the connect and the subsequent read/recv, so one value
-# covers the whole request.
-UPSTREAM_TIMEOUT_SECONDS = 3.0
+# The actual default lives in platform_config.DEFAULT_DEPENDENCY_TIMEOUT_SECONDS
+# (used when no mounted platform config overrides it) - bounded so the
+# gateway can never hang indefinitely waiting on the backend.
+# http.client.HTTPConnection applies a single socket-level timeout to both
+# the connect and the subsequent read/recv, so one value covers the whole
+# request. See GatewayConfig.upstream_timeout_seconds.
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,7 @@ class GatewayConfig:
     port: int
     upstream_host: str
     upstream_port: int
+    upstream_timeout_seconds: float
     name: str
 
 
@@ -61,7 +70,9 @@ def parse_port(raw: str, var_name: str) -> int:
     return port
 
 
-def load_config(env: Mapping[str, str] | None = None) -> GatewayConfig:
+def load_config(
+    env: Mapping[str, str] | None = None, platform_config_path: Path | None = None
+) -> GatewayConfig:
     """Build a GatewayConfig from an environment mapping (defaults to os.environ)."""
     source = os.environ if env is None else env
 
@@ -82,10 +93,13 @@ def load_config(env: Mapping[str, str] | None = None) -> GatewayConfig:
         else DEFAULT_UPSTREAM_PORT
     )
 
+    platform_cfg = load_platform_config(path=platform_config_path, env=source)
+
     return GatewayConfig(
         host=host,
         port=port,
         upstream_host=upstream_host,
         upstream_port=upstream_port,
+        upstream_timeout_seconds=platform_cfg.dependency_timeout_seconds,
         name=DEFAULT_NAME,
     )

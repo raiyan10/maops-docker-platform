@@ -57,12 +57,17 @@ image at an exact, `VERSION`-derived tag — never `latest`.
    should list only the application's own runtime files.
 
 5. **Remember the `ENTRYPOINT` override gotcha**: this image sets
-   `ENTRYPOINT ["python3", "-m", "app"]`, so `docker run <image> <cmd>`
-   *appends* `<cmd>` as arguments to the entrypoint rather than replacing
-   it — the container will just start the server and ignore your
-   command, and `docker run --rm` will hang waiting for it to exit. Use
+   `ENTRYPOINT ["python3"]` with `CMD ["-m", "app"]` as the default, so
+   `docker run <image> <cmd>` *appends* `<cmd>` as arguments to the
+   entrypoint rather than replacing it — a bare `docker run <image>
+   python3 -m app` actually runs `python3 python3 -m app` and fails. Use
    `docker run --rm --entrypoint <cmd> "$IMAGE" ...` (as above) whenever
-   you need to run something other than the server inside the image.
+   you need to run something other than the default server inside the
+   image, or omit any command entirely and rely on the image's own
+   default `CMD` (`-m app`). To run the other two roles directly (rare -
+   Compose is the documented way, since `gateway` needs `UPSTREAM_HOST`
+   and `state` needs a `/data` mount to be meaningful), override `CMD`
+   explicitly: `docker run --rm "$IMAGE" -m gateway` / `-m state`.
 
 ## What this does not cover
 
