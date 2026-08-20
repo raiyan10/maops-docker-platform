@@ -7,6 +7,16 @@ port, waits for it to answer, exercises /healthz, /readyz, and /info over
 real HTTP, verifies the JSON responses and the runtime UID, and always
 tears its own container down — on both success and failure. It never
 touches any other Docker resource.
+
+SCOPE (Day 3): this always runs the `app` role via a bare `docker run`,
+never via Compose - so `state` (app's own dependency, see
+docs/persistence.md) never exists here, and /readyz is expected to report
+a controlled dependency-unavailable 503, not `ready`. This test proves
+app's own liveness/metadata surface and non-root runtime in isolation; the
+gateway role and the full dependency-ready/persistence path are proven by
+scripts/compose/compose_integration.py instead (this mirrors the existing,
+already-documented Day 2 scope note that this script never exercises the
+gateway role either).
 """
 
 from __future__ import annotations
@@ -22,7 +32,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 STARTUP_DEADLINE_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 0.5
-REQUEST_TIMEOUT_SECONDS = 5.0
+# Comfortably exceeds the ~5-6s an unresolvable STATE_HOST DNS lookup can
+# take in this isolated (non-Compose) container - see the /readyz check
+# below; Python's http.client socket-level timeout does not bound the
+# getaddrinfo() phase itself.
+REQUEST_TIMEOUT_SECONDS = 10.0
 
 
 class SmokeTestError(RuntimeError):
@@ -134,10 +148,21 @@ def main() -> int:
             raise SmokeTestError(f"/healthz unexpected response: {status} {payload}")
         print("smoke: /healthz OK")
 
+        # This smoke test runs the `app` role via a bare `docker run`, not
+        # via Compose - so `state` (app's own STATE_HOST dependency, see
+        # docs/persistence.md) never resolves here. /readyz is now
+        # dependency-aware (Day 3), so a controlled 503 not-ready is the
+        # *correct* isolated-container result, not a failure - this smoke
+        # test only proves app's own liveness/metadata surface; the real
+        # /readyz-becomes-ready proof lives in scripts/compose/
+        # compose_integration.py, where `state` genuinely exists.
         status, payload = http_get_json(port, "/readyz")
-        if status != 200 or payload != {"status": "ready"}:
-            raise SmokeTestError(f"/readyz unexpected response: {status} {payload}")
-        print("smoke: /readyz OK")
+        if status != 503 or payload.get("status") != "not-ready":
+            raise SmokeTestError(
+                f"/readyz expected a controlled dependency-unavailable 503 "
+                f"(no 'state' service exists outside Compose), got: {status} {payload}"
+            )
+        print(f"smoke: /readyz correctly reports dependency-unavailable outside Compose ({status} {payload})")
 
         status, payload = http_get_json(port, "/info")
         if status != 200:

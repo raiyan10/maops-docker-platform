@@ -25,6 +25,7 @@ class GatewayHealthcheckTests(unittest.TestCase):
             port=0,
             upstream_host="127.0.0.1",
             upstream_port=1,
+            upstream_timeout_seconds=3.0,
             name="healthcheck-test-gateway",
         )
         self.server = build_server(config)

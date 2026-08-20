@@ -17,7 +17,7 @@ specific day's scope explicitly calls for an application change.
   single-stage Dockerfile, a one-service Compose baseline, tests,
   source/Dockerfile validation, smoke testing, runtime security
   verification, docs, agents, skills.
-- **Day 2 (v0.2.0, this scope)** — Compose multi-service topology: a new
+- **Day 2 (v0.2.0)** — Compose multi-service topology: a new
   stdlib-only `gateway/` service fronting the Day 1 `app` service, a
   two-service `compose.yaml` (`app` not host-published, `gateway` the
   sole loopback-published service), one image capable of running either
@@ -25,7 +25,17 @@ specific day's scope explicitly calls for an application change.
   closure of the Day 1 M-2 (PID 1/SIGTERM regression)/M-3 (Compose
   runtime verification) test-review findings. See
   `docs/compose-platform.md`.
-- **Day 3** — networking, configuration, volumes, persistence.
+- **Day 3 (v0.3.0, this scope)** — networking, configuration, volumes,
+  persistence: a new stdlib-only `state/` service (a durably persisted
+  monotonic counter under a named Compose volume), extending the chain to
+  `state -> app -> gateway`; two explicit Compose networks (`edge`:
+  `gateway`+`app`; `backend`: `app`+`state`, `internal: true`) replacing
+  Day 2's implicit default, with `gateway`/`state` sharing no network at
+  all; a non-secret, Compose-mounted `config/platform.json`; and closure
+  of three Day 2 review findings (the `depends_on` startup-ordering proof,
+  the `UPSTREAM_HOST`-vs-real-service cross-check, and the Compose-managed
+  [D] read-only-write proof). See `docs/networking.md`,
+  `docs/configuration.md`, and `docs/persistence.md`.
 - **Day 4** — build/image security and reproducibility.
 - **Day 5** — health, reliability, resource limits, observability.
 - **Day 6** — CI/CD, integration, release engineering.
@@ -52,15 +62,23 @@ implement a later day's scope early, even if it looks convenient.
 - `make clean` only removes known project-owned generated resources
   (local `__pycache__`/cache directories, any leftover
   `maops-smoke-*`/`maops-security-*` containers, and any leftover
-  `maops-compose-*` Compose projects, all matching this project's own
-  deterministic naming scheme) — never a broad prune, never another
-  project's resources.
+  `maops-compose-*` Compose projects together with their own named
+  volume, all matching this project's own deterministic naming scheme) —
+  never a broad prune, never another project's resources, and never the
+  named volume of a normal `docker compose up -d` development stack
+  (which uses no `-p maops-compose-*` project name).
 - The built release image (`maops-docker-platform:<VERSION>`) is left in
   place intentionally after validation; nothing in this repository's
   tooling removes it automatically.
 - No Docker socket mounts, no `--privileged`, no `network_mode: host`,
-  no `pid: host`, no host filesystem bind mounts into the application
-  container.
+  no `pid: host`, no host filesystem bind mount of arbitrary host data
+  into any service container. The one narrow exception is Compose's own
+  `configs:` mechanism (`config/platform.json`, mounted read-only into
+  `app`/`gateway`/`state` at `/etc/maops/platform.json`) — a small,
+  tracked, non-secret, version-controlled file, not a general host
+  filesystem bind mount, and it is read-only both by Compose default and
+  by explicit runtime proof (see `docs/configuration.md`). Do not widen
+  this exception to any other host path.
 
 ## Security proof philosophy
 
@@ -85,12 +103,15 @@ distinction when extending security verification in later days.
 ## Implementation and testing expectations
 
 - Python standard library only at runtime — no third-party dependency in
-  `app/` or `gateway/`. `unittest` for tests, never `pytest` merely for
-  convenience.
-- The gateway's upstream destination (`UPSTREAM_HOST`/`UPSTREAM_PORT`) is
-  fixed at process startup and never derived from an incoming request —
-  no arbitrary-URL proxying, no SSRF-style behavior. Keep this narrow if
-  the gateway grows further.
+  `app/`, `gateway/`, or `state/`. `unittest` for tests, never `pytest`
+  merely for convenience.
+- The gateway's upstream destination (`UPSTREAM_HOST`/`UPSTREAM_PORT`) and
+  the app's state destination (`STATE_HOST`/`STATE_PORT`) are each fixed
+  at process startup and never derived from an incoming request — no
+  arbitrary-URL proxying, no SSRF-style behavior. Keep this narrow if
+  either service grows further. A mounted, non-secret Compose config
+  (`config/platform.json`) may override the *timeout* bound on these
+  calls, but never the destination host.
 - Tests use loopback/in-process facilities and dynamic ports only; no
   fixed external ports, no public network, no shared mutable global test
   state, environment modifications restored on cleanup.

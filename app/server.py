@@ -4,10 +4,19 @@ Runs directly as PID 1 inside the container: no daemonization, no process
 manager, no application log files. All request/error logging goes to
 stdout/stderr only. SIGTERM/SIGINT trigger a graceful HTTPServer shutdown
 suitable for `docker stop`.
+
+As of Day 3, app also makes real, bounded outbound HTTP calls to a single
+fixed destination - `AppConfig.state_host`/`state_port`, resolved once at
+process startup from STATE_HOST/STATE_PORT (see config.py) - to demonstrate
+persistence through the `gateway -> app -> state` chain. No request path,
+query string, header, or body value is ever used to choose or influence
+that destination, mirroring gateway's own SSRF-prevention design toward
+`app`.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import platform
 import signal
@@ -26,6 +35,50 @@ JSON_CONTENT_TYPE = "application/json"
 RouteHandler = Callable[["JSONRequestHandler"], tuple[int, dict[str, object]]]
 
 
+class StateError(Exception):
+    """Raised when the state service cannot be reached or answers unusably.
+
+    Never carries the underlying exception's raw text into a client
+    response - only this module's own controlled message does.
+    """
+
+
+def _call_state(config: AppConfig, method: str, path: str) -> dict[str, object]:
+    """Make a real, bounded HTTP call to the fixed configured state service.
+
+    Raises StateError (never the raw underlying exception) on any
+    connection failure, non-200 status, or non-JSON body - callers never
+    need to catch anything except StateError.
+    """
+    try:
+        conn = http.client.HTTPConnection(
+            config.state_host,
+            config.state_port,
+            timeout=config.state_timeout_seconds,
+        )
+        try:
+            conn.request(method, path)
+            response = conn.getresponse()
+            body = response.read()
+        finally:
+            conn.close()
+    except (OSError, http.client.HTTPException) as exc:
+        raise StateError("state unavailable") from exc
+
+    if response.status != 200:
+        raise StateError(f"state returned unexpected status {response.status}")
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise StateError("state returned a malformed response") from exc
+
+    if not isinstance(payload, dict):
+        raise StateError("state returned a malformed response")
+
+    return payload
+
+
 def _route_root(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
     config = handler.app_config
     return 200, {
@@ -36,10 +89,20 @@ def _route_root(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
 
 
 def _route_healthz(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
+    # Liveness only: proves app's own process/event loop is responsive.
+    # Never calls state - that is /readyz's job.
     return 200, {"status": "ok"}
 
 
 def _route_readyz(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
+    config = handler.app_config
+    try:
+        state_status = _call_state(config, "GET", "/readyz")
+    except StateError as exc:
+        return 503, {"status": "not-ready", "error": str(exc)}
+
+    if state_status.get("status") != "ready":
+        return 503, {"status": "not-ready", "error": "state not ready"}
     return 200, {"status": "ready"}
 
 
@@ -54,18 +117,43 @@ def _route_info(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
     }
 
 
-ROUTES: dict[str, RouteHandler] = {
-    "/": _route_root,
-    "/healthz": _route_healthz,
-    "/readyz": _route_readyz,
-    "/info": _route_info,
+def _route_state_get(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
+    config = handler.app_config
+    try:
+        payload = _call_state(config, "GET", "/state")
+    except StateError as exc:
+        return 503, {"error": str(exc)}
+    return 200, payload
+
+
+def _route_state_increment(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
+    config = handler.app_config
+    try:
+        payload = _call_state(config, "POST", "/state/increment")
+    except StateError as exc:
+        return 503, {"error": str(exc)}
+    return 200, payload
+
+
+ROUTES: dict[str, dict[str, RouteHandler]] = {
+    "/": {"GET": _route_root},
+    "/healthz": {"GET": _route_healthz},
+    "/readyz": {"GET": _route_readyz},
+    "/info": {"GET": _route_info},
+    "/state": {"GET": _route_state_get},
+    "/state/increment": {"POST": _route_state_increment},
 }
 
-ALLOWED_METHODS = "GET, HEAD"
+
+def _allowed_methods(route: dict[str, RouteHandler]) -> list[str]:
+    methods = set(route.keys())
+    if "GET" in methods:
+        methods.add("HEAD")
+    return sorted(methods)
 
 
 class JSONRequestHandler(BaseHTTPRequestHandler):
-    """Serves a fixed, deterministic set of JSON GET/HEAD endpoints."""
+    """Serves a fixed, deterministic set of JSON endpoints."""
 
     server_version = "maops-docker-platform"
     app_config: AppConfig
@@ -81,14 +169,32 @@ class JSONRequestHandler(BaseHTTPRequestHandler):
         if write_body:
             self.wfile.write(body)
 
-    def _dispatch(self, write_body: bool) -> None:
+    def _send_405(self, allowed_methods: list[str], write_body: bool) -> None:
+        body = json.dumps({"error": "method not allowed"}, sort_keys=True).encode("utf-8")
+        self.send_response(405)
+        self.send_header("Content-Type", JSON_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Allow", ", ".join(allowed_methods))
+        self.end_headers()
+        if write_body:
+            self.wfile.write(body)
+
+    def _dispatch(self, method: str, write_body: bool) -> None:
         path = urlsplit(self.path).path
         route = ROUTES.get(path)
         if route is None:
             self._send_json(404, {"error": "not found"}, write_body)
             return
+
+        route_handler = route.get(method)
+        if route_handler is None and method == "HEAD":
+            route_handler = route.get("GET")
+        if route_handler is None:
+            self._send_405(_allowed_methods(route), write_body)
+            return
+
         try:
-            status, payload = route(self)
+            status, payload = route_handler(self)
         except Exception:  # noqa: BLE001 - never leak internals to the client
             self.log_error("unhandled error serving %s", path)
             self._send_json(500, {"error": "internal server error"}, write_body)
@@ -96,30 +202,20 @@ class JSONRequestHandler(BaseHTTPRequestHandler):
         self._send_json(status, payload, write_body)
 
     def do_GET(self) -> None:  # noqa: N802 - required BaseHTTPRequestHandler name
-        self._dispatch(write_body=True)
+        self._dispatch("GET", write_body=True)
 
     def do_HEAD(self) -> None:  # noqa: N802
-        self._dispatch(write_body=False)
+        self._dispatch("HEAD", write_body=False)
 
-    def _unsupported_method(self) -> None:
-        path = urlsplit(self.path).path
-        if path not in ROUTES:
-            self._send_json(404, {"error": "not found"}, write_body=True)
-            return
-        body = json.dumps({"error": "method not allowed"}, sort_keys=True).encode(
-            "utf-8"
-        )
-        self.send_response(405)
-        self.send_header("Content-Type", JSON_CONTENT_TYPE)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Allow", ALLOWED_METHODS)
-        self.end_headers()
-        self.wfile.write(body)
+    def do_POST(self) -> None:  # noqa: N802
+        self._dispatch("POST", write_body=True)
 
-    do_POST = _unsupported_method
-    do_PUT = _unsupported_method
-    do_DELETE = _unsupported_method
-    do_PATCH = _unsupported_method
+    def _method_not_implemented(self) -> None:
+        self._dispatch(self.command, write_body=True)
+
+    do_PUT = _method_not_implemented
+    do_DELETE = _method_not_implemented
+    do_PATCH = _method_not_implemented
 
     def send_error(
         self, code: int, message: str | None = None, explain: str | None = None

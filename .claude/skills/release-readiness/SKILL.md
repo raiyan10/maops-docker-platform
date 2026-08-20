@@ -5,7 +5,7 @@ description: Reusable MAOps Docker release discipline for maops-docker-platform 
 
 # Release Readiness
 
-Reusable release procedure. As of Day 2, no CI and no container registry
+Reusable release procedure. As of Day 3, no CI and no container registry
 exist — do not claim otherwise, and do not scaffold either early. Steps
 that reference a PR/tag/release describe the eventual full-portfolio
 process; this repository's own current-day rule (see `.claude/CLAUDE.md`)
@@ -40,15 +40,19 @@ from the user in that conversation.**
 
 6. **Compose** — `make compose-test`
    (`scripts/compose/compose_integration.py`) is now part of the
-   automated `make release-check` chain: it runs the real two-service
-   stack under a uniquely named project, proves gateway→app
-   communication and the app-stop/gateway-degrade,
-   app-restart/gateway-recover scenario, and inspects the real
-   Compose-created containers' hardening — this closes the Day 1 gap
-   where Compose verification was manual-only (see
-   `compose-validation`). Still worth a manual walkthrough at least once
-   per release for a human-observed sanity check, but it is no longer the
-   only evidence.
+   automated `make release-check` chain: it runs the real three-service
+   stack under a uniquely named project, proves the health-gated
+   `state -> app -> gateway` startup ordering, real network isolation
+   (`gateway`<->`state` unreachable both directions), the full
+   `gateway -> app -> state` persistence path (including survival across
+   container recreation and a full `compose down`/`up` cycle with the
+   volume retained), the state-stop/degrade, state-start/recover
+   scenario, and inspects the real Compose-created containers' hardening
+   (including a real [D] rootfs-write-rejection proof for every
+   container) — this closes the Day 1 gap where Compose verification was
+   manual-only (see `compose-validation`). Still worth a manual
+   walkthrough at least once per release for a human-observed sanity
+   check, but it is no longer the only evidence.
 
 7. **Independent reviews** — before treating a version as release-ready,
    route the diff through the relevant project agents

@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """Project-specific Compose *structural* validator.
 
-SCOPE (read this before trusting the result): this validates Day 2
-invariants specific to *this* project's `compose.yaml` (exactly two
-services, `app`/`gateway` naming, hardening flags, health/dependency
-wiring, image-version consistency with `VERSION`) against the *rendered*
-configuration (`docker compose config --format json`), parsed with Python
-stdlib `json` rather than adding a YAML dependency. It is deliberately not
-a general-purpose Compose linter and does not replace `docker compose
-config`'s own YAML-syntax validation (which this script also exercises,
-implicitly, by shelling out to it and failing loudly on a nonzero exit).
+SCOPE (read this before trusting the result): this validates Day 3
+invariants specific to *this* project's `compose.yaml` (exactly three
+services, `app`/`gateway`/`state` naming, hardening flags, health/
+dependency wiring, network topology and isolation, the named persistence
+volume, the mounted platform config, upstream-target-vs-real-service
+cross-checks, image-version consistency with `VERSION`) against the
+*rendered* configuration (`docker compose config --format json`), parsed
+with Python stdlib `json` rather than adding a YAML dependency. It is
+deliberately not a general-purpose Compose linter and does not replace
+`docker compose config`'s own YAML-syntax validation (which this script
+also exercises, implicitly, by shelling out to it and failing loudly on a
+nonzero exit).
 
 This is a *static/structural* check only: it proves what Compose was
 *asked* to run, not what the resulting containers actually do at runtime
 (a valid, harmless-looking config could still describe a container that,
 once started, behaves differently). scripts/compose/compose_integration.py
 is the runtime counterpart -- it inspects real Compose-managed containers,
-not merely this rendered config -- and is what closes the Day 1
-test-review gap (M-3) that no automated check exercised anything beyond
-`docker compose config`'s own syntax validity.
+not merely this rendered config.
+
+Closes two Day 2 review findings by widening this script's scope, not by
+adding unrelated checks: (L-1, day-02-compose-review.md) `UPSTREAM_HOST`
+now IS cross-checked against the real service set and the real shared
+network, extended here to app's own `STATE_HOST` target too; and this
+script's own network/volume/config checks are new Day 3 invariants, not a
+Day 2 carryover.
 """
 
 from __future__ import annotations
@@ -30,9 +38,18 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-EXPECTED_SERVICES = {"app", "gateway"}
+EXPECTED_SERVICES = {"app", "gateway", "state"}
 EXPECTED_APP_HEALTHCHECK = ["CMD", "python3", "-m", "app.healthcheck"]
 EXPECTED_GATEWAY_HEALTHCHECK = ["CMD", "python3", "-m", "gateway.healthcheck"]
+EXPECTED_STATE_HEALTHCHECK = ["CMD", "python3", "-m", "state.healthcheck"]
+
+EXPECTED_EDGE_MEMBERS = {"gateway", "app"}
+EXPECTED_BACKEND_MEMBERS = {"app", "state"}
+EXPECTED_NETWORK_NAMES = {"edge", "backend"}
+
+EXPECTED_VOLUME_NAMES = {"state_data"}
+EXPECTED_CONFIG_NAMES = {"platform"}
+CONFIG_TARGET = "/etc/maops/platform.json"
 
 
 class Finding:
@@ -116,12 +133,13 @@ def check_image_version(config: dict, version: str) -> list[Finding]:
     return findings
 
 
-def check_app_not_published(config: dict) -> list[Finding]:
-    app = config.get("services", {}).get("app", {})
-    ports = app.get("ports") or []
-    if ports:
-        return [Finding(f"service 'app' must not publish a host port, found: {ports}")]
-    return []
+def check_app_state_not_published(config: dict) -> list[Finding]:
+    findings: list[Finding] = []
+    for name in ("app", "state"):
+        ports = config.get("services", {}).get(name, {}).get("ports") or []
+        if ports:
+            findings.append(Finding(f"service {name!r} must not publish a host port, found: {ports}"))
+    return findings
 
 
 def check_gateway_sole_publisher_loopback(config: dict) -> list[Finding]:
@@ -192,96 +210,240 @@ def check_hardening_flags(config: dict) -> list[Finding]:
     return findings
 
 
-def check_no_named_volumes(config: dict) -> list[Finding]:
-    findings: list[Finding] = []
-    top_level_volumes = config.get("volumes") or {}
-    if top_level_volumes:
-        findings.append(
-            Finding(f"top-level 'volumes' must be absent on Day 2, found: {top_level_volumes}")
-        )
-    for name, service in config.get("services", {}).items():
-        for volume in service.get("volumes") or []:
-            if volume.get("type") == "volume":
-                findings.append(
-                    Finding(f"service {name!r}: named/persistent volume mount found: {volume}")
-                )
-    return findings
-
-
 def check_healthchecks(config: dict) -> list[Finding]:
     findings: list[Finding] = []
     services = config.get("services", {})
-
-    app_test = services.get("app", {}).get("healthcheck", {}).get("test")
-    if app_test != EXPECTED_APP_HEALTHCHECK:
-        findings.append(
-            Finding(
-                f"service 'app': healthcheck.test is {app_test!r}, expected "
-                f"{EXPECTED_APP_HEALTHCHECK!r}"
+    expected = {
+        "app": EXPECTED_APP_HEALTHCHECK,
+        "gateway": EXPECTED_GATEWAY_HEALTHCHECK,
+        "state": EXPECTED_STATE_HEALTHCHECK,
+    }
+    for name, expected_test in expected.items():
+        actual = services.get(name, {}).get("healthcheck", {}).get("test")
+        if actual != expected_test:
+            findings.append(
+                Finding(
+                    f"service {name!r}: healthcheck.test is {actual!r}, expected {expected_test!r}"
+                )
             )
-        )
-
-    gateway_test = services.get("gateway", {}).get("healthcheck", {}).get("test")
-    if gateway_test != EXPECTED_GATEWAY_HEALTHCHECK:
-        findings.append(
-            Finding(
-                f"service 'gateway': healthcheck.test is {gateway_test!r}, expected "
-                f"{EXPECTED_GATEWAY_HEALTHCHECK!r}"
-            )
-        )
     return findings
 
 
-def check_gateway_depends_on_app(config: dict) -> list[Finding]:
-    gateway = config.get("services", {}).get("gateway", {})
-    depends_on = gateway.get("depends_on") or {}
-    app_dep = depends_on.get("app")
+def check_dependency_conditions(config: dict) -> list[Finding]:
+    """Validates the Day 3 health-gated ordering chain: state -> app -> gateway."""
+    findings: list[Finding] = []
+    services = config.get("services", {})
+
+    state_depends = services.get("state", {}).get("depends_on") or {}
+    if state_depends:
+        findings.append(
+            Finding(f"service 'state' must have no depends_on (bottom of the chain), found: {state_depends}")
+        )
+
+    app_depends = services.get("app", {}).get("depends_on") or {}
+    state_dep = app_depends.get("state")
+    if state_dep is None:
+        findings.append(Finding("service 'app' does not declare depends_on: state"))
+    elif state_dep.get("condition") != "service_healthy":
+        findings.append(
+            Finding(
+                f"service 'app' depends_on 'state' condition is "
+                f"{state_dep.get('condition')!r}, expected 'service_healthy'"
+            )
+        )
+
+    gateway_depends = services.get("gateway", {}).get("depends_on") or {}
+    app_dep = gateway_depends.get("app")
     if app_dep is None:
-        return [Finding("service 'gateway' does not declare depends_on: app")]
-    if app_dep.get("condition") != "service_healthy":
-        return [
+        findings.append(Finding("service 'gateway' does not declare depends_on: app"))
+    elif app_dep.get("condition") != "service_healthy":
+        findings.append(
             Finding(
                 f"service 'gateway' depends_on 'app' condition is "
                 f"{app_dep.get('condition')!r}, expected 'service_healthy'"
             )
-        ]
+        )
+    return findings
+
+
+def _service_networks(config: dict, name: str) -> set[str]:
+    return set((config.get("services", {}).get(name, {}).get("networks") or {}).keys())
+
+
+def check_network_membership(config: dict) -> list[Finding]:
+    findings: list[Finding] = []
+    expected = {
+        "gateway": {"edge"},
+        "app": {"edge", "backend"},
+        "state": {"backend"},
+    }
+    for name, expected_networks in expected.items():
+        actual = _service_networks(config, name)
+        if actual != expected_networks:
+            findings.append(
+                Finding(
+                    f"service {name!r}: networks are {sorted(actual)}, expected {sorted(expected_networks)}"
+                )
+            )
+    return findings
+
+
+def check_gateway_state_isolation(config: dict) -> list[Finding]:
+    """Directly asserts gateway and state share no network - not merely
+    implied by check_network_membership passing (a reader shouldn't have
+    to derive the isolation property from two other checks)."""
+    gateway_nets = _service_networks(config, "gateway")
+    state_nets = _service_networks(config, "state")
+    shared = gateway_nets & state_nets
+    if shared:
+        return [Finding(f"service 'gateway' and service 'state' share network(s), expected none: {sorted(shared)}")]
     return []
 
 
-def check_no_custom_networks(config: dict) -> list[Finding]:
-    """Day 2 must use only the Compose-implicit default network.
-
-    `docker compose config` always renders a `default` network entry even
-    when none is declared in compose.yaml -- that's Compose's own default,
-    not a custom network. What must be absent is any *other* network name,
-    or a `default` entry carrying custom attributes (a non-empty `driver`,
-    `driver_opts`, `ipam.config`, etc.) that would indicate a hand-authored
-    network definition rather than the implicit one.
-    """
+def check_top_level_networks(config: dict) -> list[Finding]:
     findings: list[Finding] = []
     networks = config.get("networks") or {}
-    extra = set(networks.keys()) - {"default"}
-    if extra:
-        findings.append(Finding(f"custom network(s) declared, not permitted on Day 2: {sorted(extra)}"))
-
-    default_net = networks.get("default") or {}
-    suspicious_keys = {"driver", "driver_opts"}
-    ipam = default_net.get("ipam") or {}
-    if suspicious_keys & set(default_net.keys()):
+    names = set(networks.keys())
+    if names != EXPECTED_NETWORK_NAMES:
         findings.append(
-            Finding(f"default network carries custom attributes, not permitted on Day 2: {default_net}")
-        )
-    if ipam.get("config"):
-        findings.append(
-            Finding(f"default network has custom IPAM config, not permitted on Day 2: {ipam}")
+            Finding(f"expected exactly top-level networks {sorted(EXPECTED_NETWORK_NAMES)}, got {sorted(names)}")
         )
 
-    for name, service in config.get("services", {}).items():
-        service_networks = set((service.get("networks") or {}).keys())
-        if service_networks - {"default"}:
+    backend = networks.get("backend") or {}
+    if backend.get("internal") is not True:
+        findings.append(Finding(f"network 'backend' must be internal: true, got: {backend}"))
+
+    edge = networks.get("edge") or {}
+    if edge.get("internal", False) is not False:
+        findings.append(Finding(f"network 'edge' must not be internal, got: {edge}"))
+    return findings
+
+
+def check_state_volume(config: dict) -> list[Finding]:
+    findings: list[Finding] = []
+    volumes = config.get("volumes") or {}
+    names = set(volumes.keys())
+    if names != EXPECTED_VOLUME_NAMES:
+        findings.append(
+            Finding(f"expected exactly top-level volumes {sorted(EXPECTED_VOLUME_NAMES)}, got {sorted(names)}")
+        )
+
+    services = config.get("services", {})
+    state_volumes = services.get("state", {}).get("volumes") or []
+    named_volume_mounts = [v for v in state_volumes if v.get("type") == "volume"]
+    if len(named_volume_mounts) != 1:
+        findings.append(
+            Finding(f"service 'state' must mount exactly one named volume, found: {state_volumes}")
+        )
+    else:
+        mount = named_volume_mounts[0]
+        if mount.get("source") != "state_data" or mount.get("target") != "/data":
             findings.append(
-                Finding(f"service {name!r} attached to non-default network(s): {service_networks}")
+                Finding(
+                    f"service 'state' named-volume mount must be state_data:/data, found: {mount}"
+                )
             )
+
+    for name in ("app", "gateway"):
+        volume_mounts = [v for v in (services.get(name, {}).get("volumes") or []) if v.get("type") == "volume"]
+        if volume_mounts:
+            findings.append(
+                Finding(f"service {name!r} must not mount any named volume, found: {volume_mounts}")
+            )
+    return findings
+
+
+def check_config_object(config: dict) -> list[Finding]:
+    findings: list[Finding] = []
+    configs = config.get("configs") or {}
+    names = set(configs.keys())
+    if names != EXPECTED_CONFIG_NAMES:
+        findings.append(
+            Finding(f"expected exactly top-level configs {sorted(EXPECTED_CONFIG_NAMES)}, got {sorted(names)}")
+        )
+
+    platform_config = configs.get("platform") or {}
+    expected_file = str((REPO_ROOT / "config" / "platform.json").resolve())
+    actual_file = platform_config.get("file")
+    if actual_file != expected_file:
+        findings.append(
+            Finding(f"config 'platform' file is {actual_file!r}, expected {expected_file!r}")
+        )
+
+    services = config.get("services", {})
+    for name in EXPECTED_SERVICES:
+        service_configs = services.get(name, {}).get("configs") or []
+        matches = [
+            c for c in service_configs if c.get("source") == "platform" and c.get("target") == CONFIG_TARGET
+        ]
+        if len(matches) != 1:
+            findings.append(
+                Finding(
+                    f"service {name!r} must mount config 'platform' at {CONFIG_TARGET!r} exactly once, "
+                    f"found: {service_configs}"
+                )
+            )
+    return findings
+
+
+def check_upstream_targets(config: dict) -> list[Finding]:
+    """Cross-checks gateway's UPSTREAM_HOST and app's STATE_HOST against the
+    real service set, the real target port, AND the real shared network -
+    closes Day 2 finding L-1 (day-02-compose-review.md), widened to app's
+    own dependency on state.
+
+    A typo (e.g. UPSTREAM_HOST=nonexistent-service) or a service that
+    forgot to join the network its declared dependency actually lives on
+    both fail this check immediately, rather than only being discoverable
+    via a slow `make compose-test` run.
+    """
+    findings: list[Finding] = []
+    services = config.get("services", {})
+
+    def check_target(consumer: str, target_env_host: str, target_env_port: str, expected_target: str) -> None:
+        env = services.get(consumer, {}).get("environment") or {}
+        target_host = env.get(target_env_host)
+        target_port = env.get(target_env_port)
+
+        if target_host not in EXPECTED_SERVICES:
+            findings.append(
+                Finding(
+                    f"service {consumer!r}: {target_env_host}={target_host!r} does not name a "
+                    f"real service in this compose file {sorted(EXPECTED_SERVICES)}"
+                )
+            )
+            return
+        if target_host != expected_target:
+            findings.append(
+                Finding(
+                    f"service {consumer!r}: {target_env_host}={target_host!r}, expected {expected_target!r}"
+                )
+            )
+
+        target_service_port = str(services.get(target_host, {}).get("environment", {}).get(
+            {"app": "APP_PORT", "state": "STATE_PORT"}.get(target_host, ""), ""
+        ))
+        if target_port and target_service_port and str(target_port) != target_service_port:
+            findings.append(
+                Finding(
+                    f"service {consumer!r}: {target_env_port}={target_port!r} does not match "
+                    f"{target_host!r}'s own bound port {target_service_port!r}"
+                )
+            )
+
+        consumer_nets = _service_networks(config, consumer)
+        target_nets = _service_networks(config, target_host)
+        if not (consumer_nets & target_nets):
+            findings.append(
+                Finding(
+                    f"service {consumer!r} and its dependency {target_host!r} share no network "
+                    f"(consumer={sorted(consumer_nets)}, target={sorted(target_nets)}) - "
+                    f"{target_env_host} would be unresolvable at runtime"
+                )
+            )
+
+    check_target("gateway", "UPSTREAM_HOST", "UPSTREAM_PORT", "app")
+    check_target("app", "STATE_HOST", "STATE_PORT", "state")
     return findings
 
 
@@ -298,13 +460,17 @@ def main() -> int:
         check_service_set,
         lambda c: check_image_version(c, version),
         lambda c: check_version_fallback_defaults(version),
-        check_app_not_published,
+        check_app_state_not_published,
         check_gateway_sole_publisher_loopback,
         check_hardening_flags,
-        check_no_named_volumes,
         check_healthchecks,
-        check_gateway_depends_on_app,
-        check_no_custom_networks,
+        check_dependency_conditions,
+        check_network_membership,
+        check_gateway_state_isolation,
+        check_top_level_networks,
+        check_state_volume,
+        check_config_object,
+        check_upstream_targets,
     ]
 
     all_findings: list[Finding] = []

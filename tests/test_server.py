@@ -2,18 +2,104 @@ import http.client
 import json
 import socket
 import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from app.config import AppConfig, load_config
 from app.server import build_server
 from app.version import get_version
 
+DEFAULT_STATE_TIMEOUT_SECONDS = 3.0
+
+
+def _closed_port() -> int:
+    """Return a port number that is free right now and nothing is listening on.
+
+    Binds then immediately closes a loopback socket to obtain an OS-assigned
+    free port; the tiny window between close() and use is an accepted,
+    extremely-low-risk pattern for a genuine "connection refused" fixture
+    (same pattern already used by tests/test_gateway_server.py).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+class _FakeStateHandler(BaseHTTPRequestHandler):
+    responses: dict = {}
+    delay_seconds: float = 0.0
+
+    def _serve(self, write_body: bool) -> None:
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
+        status, body, content_type = self.responses.get(
+            self.path, (404, b'{"error": "not found"}', "application/json")
+        )
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if write_body:
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self._serve(write_body=True)
+
+    def do_POST(self) -> None:
+        self._serve(write_body=True)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass
+
+
+def start_fake_state(responses: dict, delay_seconds: float = 0.0) -> tuple[HTTPServer, threading.Thread]:
+    handler_class = type(
+        "BoundFakeStateHandler", (_FakeStateHandler,), {"responses": responses, "delay_seconds": delay_seconds}
+    )
+    server = HTTPServer(("127.0.0.1", 0), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def json_response(status: int, payload: dict) -> tuple[int, bytes, str]:
+    return status, json.dumps(payload).encode("utf-8"), "application/json"
+
+
+DEFAULT_STATE_RESPONSES = {"/readyz": json_response(200, {"status": "ready"})}
+
 
 class ServerTestCase(unittest.TestCase):
-    """Runs the real server on an OS-assigned loopback port for each test."""
+    """Runs the real app server on an OS-assigned loopback port, pointed at
+    an OS-assigned loopback fake `state` service the subclass controls via
+    `state_responses`/`use_fake_state`; both are always torn down."""
+
+    state_responses: dict = DEFAULT_STATE_RESPONSES
+    state_delay_seconds: float = 0.0
+    use_fake_state: bool = True
 
     def setUp(self) -> None:
-        config = AppConfig(host="127.0.0.1", port=0, name="test-app")
+        if self.use_fake_state:
+            self.state_server, self.state_thread = start_fake_state(self.state_responses, self.state_delay_seconds)
+            state_host = "127.0.0.1"
+            state_port = self.state_server.server_address[1]
+        else:
+            self.state_server = None
+            self.state_thread = None
+            state_host = "127.0.0.1"
+            state_port = _closed_port()
+
+        config = AppConfig(
+            host="127.0.0.1",
+            port=0,
+            name="test-app",
+            state_host=state_host,
+            state_port=state_port,
+            state_timeout_seconds=DEFAULT_STATE_TIMEOUT_SECONDS,
+        )
         self.server = build_server(config)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -23,6 +109,10 @@ class ServerTestCase(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+        if self.state_server is not None:
+            self.state_server.shutdown()
+            self.state_server.server_close()
+            self.state_thread.join(timeout=5)
 
     def _request(self, method: str, path: str) -> http.client.HTTPResponse:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -45,6 +135,11 @@ class RootEndpointTests(ServerTestCase):
 
 
 class HealthzEndpointTests(ServerTestCase):
+    """/healthz must never contact state - use_fake_state=False (a closed
+    port) and it must still succeed, proving liveness-only scope."""
+
+    use_fake_state = False
+
     def test_healthz_returns_ok(self) -> None:
         response = self._request("GET", "/healthz")
         self.assertEqual(response.status, 200)
@@ -59,12 +154,38 @@ class HealthzEndpointTests(ServerTestCase):
         self.assertIsNotNone(response.getheader("Content-Length"))
 
 
-class ReadyzEndpointTests(ServerTestCase):
-    def test_readyz_returns_ready(self) -> None:
+class ReadyzSuccessTests(ServerTestCase):
+    state_responses = {"/readyz": json_response(200, {"status": "ready"})}
+
+    def test_readyz_returns_ready_when_state_is_ready(self) -> None:
         response = self._request("GET", "/readyz")
         self.assertEqual(response.status, 200)
         payload = json.loads(response.read_body)  # type: ignore[attr-defined]
         self.assertEqual(payload, {"status": "ready"})
+
+
+class ReadyzStateNotReadyTests(ServerTestCase):
+    state_responses = {"/readyz": json_response(200, {"status": "not-ready"})}
+
+    def test_readyz_reports_state_not_ready(self) -> None:
+        response = self._request("GET", "/readyz")
+        self.assertEqual(response.status, 503)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertEqual(payload.get("status"), "not-ready")
+        self.assertIn("error", payload)
+
+
+class ReadyzStateUnavailableTests(ServerTestCase):
+    use_fake_state = False
+
+    def test_readyz_reports_unavailable_when_state_unreachable(self) -> None:
+        response = self._request("GET", "/readyz")
+        self.assertEqual(response.status, 503)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertEqual(payload.get("status"), "not-ready")
+        self.assertIn("error", payload)
+        # No raw network exception detail (e.g. errno text) is disclosed.
+        self.assertNotIn("Errno", json.dumps(payload))
 
 
 class InfoEndpointTests(ServerTestCase):
@@ -87,6 +208,54 @@ class InfoEndpointTests(ServerTestCase):
         serialized = json.dumps(payload)
         self.assertNotIn("SECRET", serialized.upper())
         self.assertNotIn("PATH=", serialized)
+
+
+class StateGetForwardingTests(ServerTestCase):
+    state_responses = {"/state": json_response(200, {"value": 5})}
+
+    def test_state_get_forwards_state_payload_unchanged(self) -> None:
+        response = self._request("GET", "/state")
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertEqual(payload, {"value": 5})
+
+
+class StateGetUnavailableTests(ServerTestCase):
+    use_fake_state = False
+
+    def test_state_get_returns_controlled_503_when_state_unreachable(self) -> None:
+        response = self._request("GET", "/state")
+        self.assertEqual(response.status, 503)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertIn("error", payload)
+        body_text = response.read_body.decode("utf-8")  # type: ignore[attr-defined]
+        self.assertNotIn("Traceback", body_text)
+        self.assertNotIn(".py", body_text)
+
+
+class StateIncrementForwardingTests(ServerTestCase):
+    state_responses = {"/state/increment": json_response(200, {"value": 6})}
+
+    def test_state_increment_forwards_as_a_real_post(self) -> None:
+        response = self._request("POST", "/state/increment")
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertEqual(payload, {"value": 6})
+
+    def test_state_increment_get_is_405(self) -> None:
+        response = self._request("GET", "/state/increment")
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.getheader("Allow"), "POST")
+
+
+class StateIncrementUnavailableTests(ServerTestCase):
+    use_fake_state = False
+
+    def test_state_increment_returns_controlled_503_when_state_unreachable(self) -> None:
+        response = self._request("POST", "/state/increment")
+        self.assertEqual(response.status, 503)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertIn("error", payload)
 
 
 class NotFoundTests(ServerTestCase):
@@ -128,6 +297,11 @@ class UnsupportedMethodTests(ServerTestCase):
     def test_post_to_unknown_path_returns_404_not_405(self) -> None:
         response = self._request("POST", "/does-not-exist")
         self.assertEqual(response.status, 404)
+
+    def test_post_to_state_returns_405(self) -> None:
+        response = self._request("POST", "/state")
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.getheader("Allow"), "GET, HEAD")
 
 
 class EndToEndConfigurationTests(unittest.TestCase):

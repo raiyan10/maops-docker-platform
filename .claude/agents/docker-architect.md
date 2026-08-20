@@ -23,12 +23,21 @@ model for:
   (`**/__pycache__/`, `**/*.pyc`, not a one-level glob); layer ordering
   minimizes rebuild cost (dependency/setup steps before frequently-
   changing application code) without adding unnecessary layers.
-- **PID 1 / process design**: the application process runs directly as
-  PID 1 (`ENTRYPOINT ["python3", "-m", "app"]` in exec form, no shell
-  wrapper, no process manager, no daemonization). SIGTERM/SIGINT are
-  handled without a signal-handler deadlock (e.g. `HTTPServer.shutdown()`
-  called from a thread other than the one running `serve_forever()`).
-  Logs go to stdout/stderr only — no application log files.
+- **PID 1 / process design**: every role's process runs directly as PID 1
+  (`ENTRYPOINT ["python3"]` in exec form plus a per-service `command:` -
+  `-m app`, `-m gateway`, or `-m state` - no shell wrapper, no process
+  manager, no daemonization). SIGTERM/SIGINT are handled without a
+  signal-handler deadlock (e.g. `HTTPServer.shutdown()` called from a
+  thread other than the one running `serve_forever()`) identically across
+  all three roles. Logs go to stdout/stderr only — no application log
+  files.
+- **Volume mount-point ownership**: `state`'s named volume (`state_data`,
+  mounted at `/data`) requires the image to pre-create `/data` owned by
+  the same non-root `10001:10001` user *before* `USER` takes effect —
+  Docker only populates a freshly created named volume's ownership from
+  what already exists at the image's mount-point path. Flag any design
+  that instead runs `state` as root, `chmod 777`s the mount, or adds a
+  privileged init container to work around this.
 - **OCI metadata**: `org.opencontainers.image.title/description/version/
   licenses` are present and accurate; `org.opencontainers.image.source`
   is only present if it points at a real, existing repository — verify
