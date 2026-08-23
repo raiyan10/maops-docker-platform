@@ -156,7 +156,7 @@ class HealthzEndpointTests(GatewayTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.getheader("Content-Type"), "application/json")
         payload = json.loads(response.read_body)  # type: ignore[attr-defined]
-        self.assertEqual(payload, {"status": "ok"})
+        self.assertEqual(payload, {"status": "ok", "role": "gateway"})
 
     def test_healthz_head_has_no_body(self) -> None:
         response = self._request("HEAD", "/healthz")

@@ -43,9 +43,12 @@ ad hoc `docker run` container this script itself starts.
   appuser`.
 - *Docker runtime inspection*: the built image's `Config.User` is
   `10001:10001`.
-- *Kernel/process verification*: `docker exec <container> id -u` / `id
-  -g` both return `10001` for the actual running process. Verified
-  2026-08-18: `uid=10001 gid=10001`.
+- *Kernel/process verification*: `docker exec <container>
+  /usr/bin/python3.13 -c "import os; print(os.getuid()); print(os.getgid())"`
+  returns `10001`/`10001` for the actual running process (Day 4: the
+  final runtime is Distroless and has no `id` binary - this stdlib-only
+  probe is the shell-free equivalent, same [D] evidence tier). Verified
+  2026-08-20 (`maops-docker-platform:0.4.0`): `uid=10001 gid=10001`.
 
 ## Read-only root filesystem
 
@@ -59,10 +62,13 @@ ad hoc `docker run` container this script itself starts.
   Compose-managed containers.
 - *Kernel/process verification*: an actual write attempt inside the
   running hardened container was executed and rejected, with the service
-  continuing to serve requests afterward. Verified 2026-08-18 (direct
-  `docker run`, `app` role): `sh -c 'echo probe > /etc/maops-readonly-probe'`
-  exited non-zero with `sh: cannot create /etc/maops-readonly-probe:
-  Read-only file system`, and a subsequent `/healthz` probe still
+  continuing to serve requests afterward. Verified 2026-08-20 (direct
+  `docker run`, `app` role, `maops-docker-platform:0.4.0`): a stdlib-only
+  Python probe (`open('/etc/maops-readonly-probe', 'w')` - Day 4: the
+  final runtime is Distroless and has no shell, so the probe execs
+  `/usr/bin/python3.13 -c '...'` directly rather than `sh -c 'echo ...'`)
+  raised `PermissionError: [Errno 30] Read-only file system:
+  '/etc/maops-readonly-probe''`, and a subsequent `/healthz` probe still
   returned `200`. **As of Day 3**, this exact [D] proof is also performed
   automatically against every Compose-managed container (`app`,
   `gateway`, `state`) by `scripts/compose/compose_integration.py` —
@@ -189,21 +195,24 @@ execution remains forbidden.
 ## Healthcheck
 
 - *Desired*: `docker/app/Dockerfile` declares `HEALTHCHECK --interval=10s
-  --timeout=3s --start-period=5s --retries=3 CMD ["python3", "-m",
-  "app.healthcheck"]` as the image-level (app-role) default — a
+  --timeout=3s --start-period=5s --retries=3 CMD ["/usr/bin/python3.13",
+  "-m", "app.healthcheck"]` as the image-level (app-role) default — a
   stdlib-only probe (`http.client`, not `urllib.request`, to avoid
   proxy-environment-variable interference) that calls the app's own
   `/healthz` over loopback. `compose.yaml` overrides this per-service:
-  `gateway`'s healthcheck is `python3 -m gateway.healthcheck` and
-  `state`'s is `python3 -m state.healthcheck`, each probing only its own
-  `/healthz` (liveness only) — never a dependency, so any healthcheck
-  failure always means that service's own process is unresponsive, not
-  that something it depends on is down. No `curl`/`wget` was installed
-  merely to support any of the three probes.
+  `gateway`'s healthcheck is `/usr/bin/python3.13 -m gateway.healthcheck`
+  and `state`'s is `/usr/bin/python3.13 -m state.healthcheck`, each
+  probing only its own `/healthz` (liveness only) — never a dependency,
+  so any healthcheck failure always means that service's own process is
+  unresponsive, not that something it depends on is down. No `curl`/
+  `wget` was installed merely to support any of the three probes. Day 4:
+  the absolute interpreter path is required, not stylistic — the final
+  runtime is Distroless and has no shell to perform PATH resolution
+  against a bare `python3` name.
 - *Docker runtime inspection*: every service's `Healthcheck.Test` is
   present and not `NONE`; each running container's `State.Health.Status`
   was polled to a bounded deadline and observed to reach `healthy`.
-  Verified 2026-08-19 (`maops-docker-platform:0.3.0`, both direct-`docker
+  Verified 2026-08-20 (`maops-docker-platform:0.4.0`, both direct-`docker
   run` and Compose-managed containers): healthy well inside each
   `start_period`, in the proven order `state` -> `app` -> `gateway`.
 - A negative-path check (the probe returning failure when the target is
@@ -214,14 +223,55 @@ execution remains forbidden.
   `1` rather than an uncaught traceback, in all three healthcheck modules.
 - *Regression protection*: `scripts/lint/check_dockerfile.py`'s
   `check_healthcheck()` asserts the Dockerfile's `HEALTHCHECK CMD` is
-  *exactly* `["python3", "-m", "app.healthcheck"]` (not merely "a
-  `HEALTHCHECK` exists"), and `scripts/compose/check_compose.py` asserts
-  the exact same for all three services' `healthcheck.test` in the
-  rendered Compose config — a regression to the broken bare-script form
-  (`python3 app/healthcheck.py`, which breaks because `/app` isn't on
-  `sys.path` for a bare script) now fails automated validation instead of
+  *exactly* `["/usr/bin/python3.13", "-m", "app.healthcheck"]` (not
+  merely "a `HEALTHCHECK` exists"), and `scripts/compose/check_compose.py`
+  asserts the exact same for all three services' `healthcheck.test` in
+  the rendered Compose config — a regression to a bare `python3`
+  invocation (which would depend on shell PATH resolution the Distroless
+  final runtime cannot perform) now fails automated validation instead of
   being caught only by `make security-check`'s ~30s runtime health-status
   polling.
+
+### Role-aware liveness (Day 4 — closes finding H-1)
+
+Each service's `/healthz` remains a *local process liveness* check only —
+it never calls a dependency, and `/readyz`'s dependency-aware semantics are
+unchanged. Prior to this fix, all three services' `/healthz` bodies were
+behaviorally identical (`{"status": "ok"}`), so `healthcheck_module_for_role()`
+correctly selected a different probe *module name* per role, but the
+probe itself had no way to detect that it was talking to the wrong
+service — `python -m state.healthcheck` exited `0` against an `app` or
+`gateway` container just as readily as against a real `state` container,
+the exact scenario the final Day 4 independent review reproduced against
+a live container and classified High/fix-before-release.
+
+Each `/healthz` now additionally carries a fixed, non-secret `role` field
+identifying which MAOps workload is answering:
+
+```json
+{"status": "ok", "role": "app"}
+{"status": "ok", "role": "gateway"}
+{"status": "ok", "role": "state"}
+```
+
+Each of `app.healthcheck`/`gateway.healthcheck`/`state.healthcheck`
+now defines its own `EXPECTED_ROLE` constant and accepts a response only
+when *both* `status == "ok"` **and** `role == EXPECTED_ROLE` — a
+well-formed `{"status": "ok"}` from the wrong service (missing `role`,
+or a mismatched one) is rejected, not merely a malformed/unreachable one.
+No environment, hostname, container ID, IP address, PID, secret, or
+internal configuration is exposed — only the fixed role name.
+
+*Proof*: `scripts/compose/compose_integration.py`'s
+`check_role_discrimination_matrix()` runs all three healthcheck modules
+against each of the three real, Compose-managed role containers and
+asserts the full 3x3 matrix — each container's own role's module exits
+`0`, and both other roles' modules exit non-zero, on every container.
+Direct-container-level unit tests in `tests/test_healthcheck.py`,
+`tests/test_gateway_healthcheck.py`, and `tests/test_state_healthcheck.py`
+exercise the real `check()` parsing/validation path (not merely the
+`EXPECTED_ROLE` constant) against a stub server returning a correct role,
+a wrong role, and a missing role.
 
 ## PID 1 / SIGTERM lifecycle (Day 2 — closes Day 1 finding M-2)
 
@@ -232,14 +282,17 @@ automated test failures anywhere. `scripts/verify/security_check.py`'s
 `check_lifecycle_docker_stop()` now issues a real `docker stop` (real
 SIGTERM, bounded 10s grace period) against the running hardened container
 and asserts a clean, fast exit (`ExitCode == 0`, `Status == "exited"`,
-elapsed well under the grace period) — verified 2026-08-19: exit code 0
-in ~0.55-0.73s. `check_kernel_pid1_identity()` additionally asserts PID 1
-is genuinely `python3 -m app`, read from `/proc/1/cmdline` inside the
-container, not merely inferred from the Dockerfile. This check runs last
-among container-requiring checks, since it stops the container.
-`scripts/compose/compose_integration.py` proves the equivalent PID 1
-identity (`python3 -m app` / `-m gateway` / `-m state`) for every
-Compose-managed container.
+elapsed well under the grace period) — verified 2026-08-20
+(`maops-docker-platform:0.4.0`): exit code 0 in ~0.46s.
+`check_kernel_pid1_identity()` additionally asserts PID 1 is genuinely
+`/usr/bin/python3.13 -m app` (Day 4: the absolute interpreter path — the
+Distroless final runtime has no shell for PATH resolution), read from
+`/proc/1/cmdline` inside the container via a stdlib-only Python probe (no
+`cat`, which the Distroless runtime also lacks), not merely inferred from
+the Dockerfile. This check runs last among container-requiring checks,
+since it stops the container. `scripts/compose/compose_integration.py`
+proves the equivalent PID 1 identity (`/usr/bin/python3.13 -m app` /
+`-m gateway` / `-m state`) for every Compose-managed container.
 
 ## Compose-level and Compose-managed-container verification (Day 2 —
 closes Day 1 finding M-3; extended Day 3)
@@ -259,23 +312,70 @@ Compose-mounted-config-write-rejection proof for every container — see
 same script exercises, and `docs/networking.md` for the network
 segmentation proofs it also performs.
 
-## Day 3 limitations (deliberately not implemented yet)
+## Day 4 additions (build/image security and reproducibility)
 
-- No vulnerability scanner, no SBOM generation — planned for Day 4 (build/
-  image security and reproducibility); see `docs/roadmap.md`.
+- **Shellless Distroless final runtime**: the release image's final
+  runtime stage is `gcr.io/distroless/python3-debian13:nonroot`, which
+  genuinely has no `/bin/sh`/`/bin/bash` (verified: `docker exec
+  <container> /bin/sh -c 'echo probe'` fails with "no such file or
+  directory" — this is now an *expected*, asserted security property, not
+  an accident) and no `apt`/`dpkg` package-manager executable. `pip` and
+  `setuptools` are neither importable nor present as executables. See
+  `docs/build-security.md` for the full rationale (the originally planned
+  `python:3.13-slim` runtime was rejected on 4 unfixed CRITICAL
+  `perl-base` findings) and `scripts/build/image_audit.py` for the
+  automated proof of all of the above.
+- **Two-stage build**: a digest-pinned `python:3.13-slim` builder stage
+  (filesystem preparation only — never entering the final image) and the
+  digest-pinned Distroless final stage. `scripts/lint/check_dockerfile.py`
+  validates both `FROM` pins and asserts no `RUN` instruction exists in
+  the shellless final stage.
+- **Image-level immutability**: application source is root-owned in the
+  built image (no `--chown` on the final stage's `COPY --from=builder`
+  instructions), independent of and in addition to the `read_only: true`
+  rootfs hardening above. Proven with a real attempted write (a
+  stdlib-only Python probe — the Distroless runtime has no shell)
+  against a container started with *no* hardening flags at all. See
+  `docs/build-security.md` for the full proof and rationale.
+- **Numeric runtime UID/GID, not Distroless's own identity**: this
+  Dockerfile sets its own explicit `USER 10001:10001` rather than
+  inheriting the Distroless `nonroot` tag's baked-in `65532:65532`
+  identity — the `nonroot` tag is used only for its minimal, shell-free
+  *content*.
+- **Deterministic, reproducible builds**: `make build` still uses
+  BuildKit's reproducible-builds export mode (unchanged mechanism across
+  the migration); `make reproducibility-check` proves exact image-ID
+  equality across two independent builds of the two-stage Dockerfile. See
+  `docs/build-security.md`.
+- **SBOM and vulnerability scanning**: `make sbom`/`sbom-check` (Syft,
+  SPDX JSON) and `make vuln-scan` (Trivy, JSON, with an explicit
+  Critical/fixable-High-blocks-release policy, unweakened by the runtime
+  migration) now exist and are wired into `make release-check`. Neither
+  scanner is ever given the Docker socket. See `docs/supply-chain.md` —
+  the Distroless-based release image's vulnerability policy genuinely
+  passes (Critical=0, fixable High=0), reported honestly alongside the
+  15 unfixed-High findings that remain, non-blocking under policy.
+- **Project-specific image policy audit**: `scripts/build/image_audit.py`
+  (`make image-audit`) validates release-image invariants (tag/version,
+  non-root user, OCI metadata truthfulness, package presence, `/data`
+  ownership, image-level immutability, absence of repository-only/
+  secret-shaped/setuid-setgid/world-writable content, shell absence,
+  package-manager absence, pip/setuptools absence, expected Python
+  executable).
+
+## Day 4 limitations (deliberately not implemented yet)
+
 - No resource limits (CPU/memory) — planned for Day 5.
 - No CI-enforced verification — gates are local (`make release-check`)
   only; Day 6 adds CI/CD.
-- No multi-stage build — the current image has no build-time toolchain to
-  strip out (stdlib-only application), so a second stage would add
-  complexity without a corresponding benefit yet; revisit if a future
-  day's dependency adds a compiler/toolchain.
+- No cryptographic build provenance/attestation/signing — deferred past
+  Day 4, see `docs/build-security.md`.
 - DNS-resolution-phase bound for `app`'s/`gateway`'s outbound dependency
   calls — see `docs/persistence.md`'s scope-limitations note; only
   observable when the target hostname cannot resolve at all, which never
   happens inside a correctly configured Compose stack.
-- This document reflects a point-in-time verification run (2026-08-19,
-  `maops-docker-platform:0.3.0`). Re-run `make security-check` and `make
-  compose-test` after any change to `docker/app/Dockerfile`,
-  `compose.yaml`, `app/`, `gateway/`, or `state/` before trusting these
-  figures again.
+- This document reflects a point-in-time verification run (2026-08-20,
+  `maops-docker-platform:0.4.0`, Distroless-based release image). Re-run
+  `make security-check`, `make image-audit`, and `make compose-test`
+  after any change to `docker/app/Dockerfile`, `compose.yaml`, `app/`,
+  `gateway/`, or `state/` before trusting these figures again.

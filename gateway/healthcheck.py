@@ -2,8 +2,10 @@
 
 Connects to the gateway's own /healthz endpoint over loopback - liveness
 only, never the upstream app - and exits 0 only on an HTTP 200 with the
-expected JSON body. Uses http.client (not urllib.request) to avoid any
-proxy-environment-variable interference.
+expected JSON body AND role=="gateway" - a bare {"status": "ok"} from some
+other MAOps service listening on the same port must not be accepted as
+this service's own liveness (Day 4 finding H-1). Uses http.client (not
+urllib.request) to avoid any proxy-environment-variable interference.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import sys
 from gateway.config import DEFAULT_GATEWAY_PORT, load_config
 
 TIMEOUT_SECONDS = 2.0
+EXPECTED_ROLE = "gateway"
 
 
 def check() -> bool:
@@ -38,7 +41,10 @@ def check() -> bool:
     except json.JSONDecodeError:
         return False
 
-    return payload.get("status") == "ok"
+    if not isinstance(payload, dict):
+        return False
+
+    return payload.get("status") == "ok" and payload.get("role") == EXPECTED_ROLE
 
 
 if __name__ == "__main__":

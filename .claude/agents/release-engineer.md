@@ -43,19 +43,40 @@ Review the project for release readiness:
   history` totals.
 - **Release-check composition**: `make release-check` actually encodes
   `quality (test -> lint -> dockerfile-check -> compose-check) -> build
-  -> inspect -> smoke -> security-check -> compose-test` as a real
+  -> inspect -> image-audit -> smoke -> security-check -> compose-test ->
+  reproducibility-check -> sbom -> sbom-check -> vuln-scan` as a real
   dependency chain in the Makefile (not just documented informally), and
   every step's failure propagates (no swallowed exit code). `compose-test`
   (`scripts/compose/compose_integration.py`) must perform real Compose
   runtime verification of all three services — a step that only runs
   `docker compose config` is not sufficient and would silently reopen Day
-  1 finding M-3. `smoke` (`scripts/smoke/container_smoke.py`) still
-  exercises the `app` role via a bare `docker run` only, outside Compose —
-  verify its `/readyz` expectation is honestly scoped to that context
-  (`state` genuinely doesn't exist there, so a controlled 503 is the
-  correct isolated-container result, not a failure).
+  1 finding M-3. `smoke` (`scripts/smoke/container_smoke.py`) exercises
+  the `app` role via a bare `docker run` (verify its `/readyz`
+  expectation is honestly scoped to that isolated context — `state`
+  genuinely doesn't exist there, so a controlled 503 is correct, not a
+  failure) *and*, as of Day 4, a multi-role chain (`state`+`app`+
+  `gateway`, no Compose) — verify both halves still run, and that Make's
+  dependency structure doesn't accidentally rebuild the application image
+  repeatedly (`reproducibility-check`'s own two internal builds are the
+  one deliberate exception).
+- **Deterministic build / reproducibility (Day 4)**: `make build` uses
+  BuildKit's `rewrite-timestamp=true` export mode with a
+  `SOURCE_DATE_EPOCH` derived from the current commit timestamp, never
+  the wall clock. `make reproducibility-check` must independently prove
+  two clean builds produce the identical image ID — verify this by
+  reading its actual comparison logic (image ID, RootFS, Config, and a
+  normalized filesystem manifest), not by trusting a printed "PASS".
+- **Supply-chain gate (Day 4)**: `make sbom`/`sbom-check` (Syft, SPDX
+  JSON) and `make vuln-scan` (Trivy, JSON) must scan the exact release
+  image via a `docker save` archive, never the live daemon socket, using
+  scanner images pinned by exact digest in `security/scanners.lock`.
+  Verify the vulnerability policy (any CRITICAL, or any HIGH with a fix
+  available, fails the gate) is enforced honestly — a release with a
+  genuinely unfixed blocking finding should make `vuln-scan`/
+  `release-check` fail, not pass via a silently added `.trivyignore` or
+  loosened policy threshold.
 - **No premature publishing**: no GHCR/Docker Hub configuration, no CI
-  workflow, no tag beyond `v0.2.0`, no `v0.3.0` GitHub release exists yet
+  workflow, no tag beyond `v0.3.0`, no `v0.4.0` GitHub release exists yet
   — confirm nothing in the repository asserts otherwise. Later days
   (Day 6+) will add real CI/registry/release engineering; this agent owns
   reviewing that when it arrives, but must not scaffold it early.

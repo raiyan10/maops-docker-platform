@@ -30,6 +30,12 @@ a dynamic loopback-only host port, and proves real behavior:
 - the mounted platform config is genuinely read-only inside every
   container (a real rejected write, not just `docker inspect`)
 - `state`'s /data mount is genuinely writable despite the read-only rootfs
+- `backend`'s real `docker network inspect` output shows `Internal: true`
+  (and `edge`'s shows `Internal: false`) - a genuine [C]-tier runtime
+  check against the live Docker network object, not merely the [A]-tier
+  rendered-config check `check_compose.py` already performs (closes Day 3
+  finding A-3, day-03-security-review.md M-2: `docs/networking.md`
+  previously claimed this runtime proof existed when it did not)
 
 Deliberately reuses scripts/verify/security_check.py's existing [C]/[D]
 container-inspection check functions (they already operate generically on
@@ -40,6 +46,16 @@ Uses its own uniquely named Compose project (`maops-compose-<uuid>`) and
 tears it down - on success or failure - via `docker compose ... down -v`,
 removing only this run's own named volume. Never touches any other
 Compose project or Docker resource, and never runs a global prune.
+
+SIGTERM handling (Day 4, closes Day 3 finding A-5,
+day-03-compose-review.md M-1): a bare SIGTERM's default disposition kills
+the interpreter immediately, running no `finally` block - a real,
+independently-reproduced Day 3 review finding showed this leaves the full
+3-container/2-network/1-volume stack running with an empty, unflushed log.
+`_install_sigterm_handler()` converts SIGTERM into a catchable
+`_TerminatedError` (mirroring `app`/`gateway`/`state`'s own
+`server.py`-level SIGTERM handling), and stdout is put into line-buffered
+mode so no diagnostic output is silently lost.
 """
 
 from __future__ import annotations
@@ -50,6 +66,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -57,6 +74,30 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
+
+# Closes Day 3 finding A-5 (day-03-compose-review.md M-1): a SIGTERM mid-run
+# previously bypassed this script's own try/finally cleanup entirely (the
+# interpreter's default SIGTERM disposition is immediate termination, no
+# exception, no finally). Line-buffering stdout also closes the same
+# finding's secondary observation that the diagnostic log file was found
+# completely empty after a SIGTERM, because block-buffered output to a
+# non-TTY file was never flushed before the process died.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
+
+class _TerminatedError(RuntimeError):
+    """Raised from the SIGTERM handler so termination routes through the
+    normal try/finally teardown path instead of the interpreter's silent
+    default disposition (immediate death, no finally, no diagnostic)."""
+
+
+def _handle_sigterm(signum: int, frame: object) -> None:
+    raise _TerminatedError(f"received signal {signum} (SIGTERM)")
+
+
+def _install_sigterm_handler() -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 COMPOSE_FILE = REPO_ROOT / "compose.yaml"
@@ -72,6 +113,49 @@ RECOVER_DEADLINE_SECONDS = 60.0
 
 CONFIG_TARGET_PATH = "/etc/maops/platform.json"
 PROTECTED_ROOTFS_PROBE_PATH = "/etc/maops-readonly-probe"
+
+# Absolute interpreter path (Day 4): the release image's final runtime is
+# Distroless (no shell, no coreutils), so every in-container probe execs
+# this directly rather than a bare "python3" name.
+PYTHON_BIN = "/usr/bin/python3.13"
+_CAT_PROC_1_CMDLINE_SOURCE = "from pathlib import Path; print(Path('/proc/1/cmdline').read_text(), end='')"
+_DNS_RESOLVE_SOURCE_TEMPLATE = "import socket; socket.gethostbyname({hostname!r})"
+
+
+def _write_rejected_probe_source(path: str) -> str:
+    """Mirrors scripts/verify/security_check.py's own probe of the same
+    shape - a real attempted write, rejected via OSError, no shell
+    involved (the Distroless final runtime has none)."""
+    return (
+        "import sys\n"
+        f"path = {path!r}\n"
+        "try:\n"
+        "    with open(path, 'w') as f:\n"
+        "        f.write('probe')\n"
+        "except OSError as exc:\n"
+        "    print(f'write rejected: {exc}')\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    print('write UNEXPECTEDLY SUCCEEDED')\n"
+        "    sys.exit(0)\n"
+    )
+
+
+def _write_succeeds_probe_source(path: str) -> str:
+    return (
+        "import os, sys\n"
+        f"path = {path!r}\n"
+        "try:\n"
+        "    with open(path, 'w') as f:\n"
+        "        f.write('probe')\n"
+        "    os.remove(path)\n"
+        "except OSError as exc:\n"
+        "    print(f'write failed: {exc}')\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    print('write succeeded')\n"
+        "    sys.exit(0)\n"
+    )
 
 EXPECTED_NETWORKS = {
     "gateway": {"edge"},
@@ -133,9 +217,9 @@ def get_container_image(sc: ModuleType, container_name: str) -> str:
 
 
 def get_pid1_cmdline(sc: ModuleType, container_name: str) -> list[str]:
-    result = sc.run_docker(["exec", container_name, "cat", "/proc/1/cmdline"])
+    result = sc.run_docker(["exec", container_name, PYTHON_BIN, "-c", _CAT_PROC_1_CMDLINE_SOURCE])
     if result.returncode != 0:
-        raise ComposeIntegrationError(f"docker exec {container_name} cat /proc/1/cmdline failed: {result.stderr.strip()}")
+        raise ComposeIntegrationError(f"docker exec {container_name} (read /proc/1/cmdline) failed: {result.stderr.strip()}")
     return [part for part in result.stdout.split("\x00") if part]
 
 
@@ -219,7 +303,9 @@ def check_config_mount_readonly(sc: ModuleType, container_name: str):
         )
     configured_readonly = config_mount.get("RW") is False
 
-    write_result = sc.run_docker(["exec", container_name, "sh", "-c", f"echo probe > {CONFIG_TARGET_PATH}"])
+    write_result = sc.run_docker(
+        ["exec", container_name, PYTHON_BIN, "-c", _write_rejected_probe_source(CONFIG_TARGET_PATH)]
+    )
     write_rejected = write_result.returncode != 0
 
     passed = configured_readonly and write_rejected
@@ -227,20 +313,106 @@ def check_config_mount_readonly(sc: ModuleType, container_name: str):
     return sc.CheckResult(sc.CAT_KERNEL, "platform config mount rejects a real write ([C]+[D])", passed, detail)
 
 
+ALL_ROLE_HEALTHCHECK_MODULES = ("app", "gateway", "state")
+
+
+def check_role_discrimination_matrix(sc: ModuleType, containers: dict[str, str]):
+    """The core H-1 regression proof: against each of the three real,
+    Compose-managed role containers, run all three healthcheck modules and
+    assert that only the container's own role's module exits 0 - closing
+    Day 4 finding H-1 (`/healthz` used to be behaviorally identical across
+    all three roles, so `python -m state.healthcheck` exited 0 against an
+    app or gateway container too; `healthcheck_module_for_role()` correctly
+    selected a different module *name* per role, but the modules
+    themselves had no way to reject a same-shaped response from the wrong
+    service).
+
+    A single CheckResult represents the full 3x3 matrix rather than nine
+    separate headline checks - the failure detail lists every mismatched
+    cell so a failure is still fully diagnosable.
+    """
+    mismatches: list[str] = []
+    matrix_lines: list[str] = []
+    for target_role, target_container in containers.items():
+        row = []
+        for probe_role in ALL_ROLE_HEALTHCHECK_MODULES:
+            probe_module = sc.healthcheck_module_for_role(probe_role)
+            result = sc.run_docker(["exec", target_container, PYTHON_BIN, "-m", probe_module])
+            exited_zero = result.returncode == 0
+            expected_zero = probe_role == target_role
+            row.append(f"{probe_role}={'PASS' if exited_zero else 'FAIL'}")
+            if exited_zero != expected_zero:
+                mismatches.append(
+                    f"target={target_role} probe={probe_role} expected_exit_zero={expected_zero} "
+                    f"actual_exit_zero={exited_zero}"
+                )
+        matrix_lines.append(f"{target_role}: {', '.join(row)}")
+
+    passed = not mismatches
+    detail = "; ".join(matrix_lines) if passed else "; ".join(matrix_lines) + " | MISMATCHES: " + "; ".join(mismatches)
+    return sc.CheckResult(
+        sc.CAT_KERNEL,
+        "3x3 role-discrimination matrix: each container's healthcheck module accepts only its own role",
+        passed,
+        detail,
+    )
+
+
 def check_state_data_write_succeeds(sc: ModuleType, container_name: str):
     """[D] proves /data is genuinely writable despite the container's own
     read-only rootfs - the counterpart to check_kernel_readonly_write_fails
     (which proves the rootfs itself rejects writes)."""
     probe_path = "/data/.maops-write-probe"
-    write_result = sc.run_docker(["exec", container_name, "sh", "-c", f"echo probe > {probe_path} && rm -f {probe_path}"])
+    write_result = sc.run_docker(
+        ["exec", container_name, PYTHON_BIN, "-c", _write_succeeds_probe_source(probe_path)]
+    )
     passed = write_result.returncode == 0
-    detail = f"write+cleanup exit={write_result.returncode} stderr={write_result.stderr.strip()!r}"
+    detail = f"write+cleanup exit={write_result.returncode} stdout={write_result.stdout.strip()!r}"
     return sc.CheckResult(sc.CAT_KERNEL, "state's /data mount accepts a real write despite read-only rootfs", passed, detail)
+
+
+def check_network_internal_flag(sc: ModuleType, project: str, short_network_name: str, expected_internal: bool):
+    """Real, live `docker network inspect` proof of the network's `Internal`
+    flag - closes Day 3 finding A-3 (day-03-security-review.md M-2):
+    `docs/networking.md` previously claimed this exact runtime proof under
+    its "Runtime verification" heading, but only `check_compose.py`'s
+    [A]-tier static check against the *rendered* compose config actually
+    existed; no script ever called `docker network inspect` on the live
+    network object. This is that missing [C]-tier check.
+
+    Compose's default network-naming convention (no `name:` override in
+    compose.yaml's top-level `networks:`) is `<project>_<network>`.
+    """
+    full_name = f"{project}_{short_network_name}"
+    result = sc.run_docker(["network", "inspect", full_name, "--format", "{{json .Internal}}"])
+    if result.returncode != 0:
+        return sc.CheckResult(
+            sc.CAT_RUNTIME,
+            f"docker network inspect succeeds for {short_network_name!r}",
+            False,
+            result.stderr.strip(),
+        )
+    try:
+        actual_internal = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return sc.CheckResult(
+            sc.CAT_RUNTIME,
+            f"docker network inspect {short_network_name!r} returns valid JSON",
+            False,
+            result.stdout.strip(),
+        )
+    passed = actual_internal == expected_internal
+    return sc.CheckResult(
+        sc.CAT_RUNTIME,
+        f"network {short_network_name!r} real docker network inspect Internal=={expected_internal}",
+        passed,
+        f"actual Internal={actual_internal!r} (network={full_name!r})",
+    )
 
 
 def dns_resolves(sc: ModuleType, container_name: str, hostname: str) -> bool:
     result = sc.run_docker(
-        ["exec", container_name, "python3", "-c", f"import socket; socket.gethostbyname({hostname!r})"]
+        ["exec", container_name, PYTHON_BIN, "-c", _DNS_RESOLVE_SOURCE_TEMPLATE.format(hostname=hostname)]
     )
     return result.returncode == 0
 
@@ -305,6 +477,14 @@ def print_result(result) -> None:
 
 
 def main() -> int:
+    # Closes Day 3 finding A-5 (day-03-compose-review.md M-1): install
+    # before anything Docker-related starts, so a SIGTERM at any point
+    # during this run - including mid-`docker compose up -d` - is
+    # converted into a catchable exception that still reaches the
+    # try/finally teardown below, rather than killing the interpreter
+    # immediately with no cleanup and no diagnostic output.
+    _install_sigterm_handler()
+
     if shutil.which("docker") is None:
         print("compose_integration: docker CLI not found on PATH", file=sys.stderr)
         return 1
@@ -369,6 +549,17 @@ def main() -> int:
             if not passed:
                 raise ComposeIntegrationError(f"{name} network membership mismatch: {actual_networks}")
         print("compose_integration: real network membership matches the declared edge/backend topology")
+
+        # Closes Day 3 finding A-3 (day-03-security-review.md M-2): a real
+        # [C]-tier `docker network inspect` proof of Internal, not merely
+        # the [A]-tier rendered-config check check_compose.py already does.
+        backend_internal = check_network_internal_flag(sc, project, "backend", True)
+        results.append(backend_internal)
+        edge_internal = check_network_internal_flag(sc, project, "edge", False)
+        results.append(edge_internal)
+        if not (backend_internal.passed and edge_internal.passed):
+            raise ComposeIntegrationError("live docker network inspect Internal flag did not match the declared topology")
+        print("compose_integration: real docker network inspect confirms backend.Internal=true, edge.Internal=false")
 
         for name in ("app", "state"):
             bindings = get_port_bindings(sc, containers[name])
@@ -437,7 +628,7 @@ def main() -> int:
             raise ComposeIntegrationError("gateway process did not remain alive after state was stopped")
         print("compose_integration: app and gateway processes remained alive after state was stopped")
 
-        app_liveness = sc.run_docker(["exec", app_container, "python3", "-m", "app.healthcheck"])
+        app_liveness = sc.run_docker(["exec", app_container, PYTHON_BIN, "-m", "app.healthcheck"])
         if app_liveness.returncode != 0:
             raise ComposeIntegrationError("app local liveness (/healthz) failed while state was down")
         print("compose_integration: app's own /healthz liveness stayed healthy while state was down")
@@ -539,12 +730,16 @@ def main() -> int:
             # Closes Day 2 finding M-1 (day-02-security-review.md) / L-2
             # (day-02-compose-review.md): a real [D] rejected-write proof
             # for Compose-managed containers, not merely the [C]
-            # "Docker was asked" check Day 2 shipped.
-            results.append(sc.check_kernel_readonly_write_fails(container, 0))
+            # "Docker was asked" check Day 2 shipped. role=name closes Day 3
+            # finding A-2 (day-03-security-review.md M-1): the "service kept
+            # serving" half now genuinely probes *this* container's own role
+            # (state.healthcheck/gateway.healthcheck/app.healthcheck), not
+            # always app.healthcheck.
+            results.append(sc.check_kernel_readonly_write_fails(container, 0, role=name))
             results.append(check_config_mount_readonly(sc, container))
 
             cmdline = get_pid1_cmdline(sc, container)
-            expected_cmdline = ["python3", "-m", name]
+            expected_cmdline = [PYTHON_BIN, "-m", name]
             results.append(
                 sc.CheckResult(
                     sc.CAT_KERNEL,
@@ -556,6 +751,14 @@ def main() -> int:
 
         results.append(check_state_data_write_succeeds(sc, state_container))
 
+        # Day 4 finding H-1's core regression proof - see docstring on
+        # check_role_discrimination_matrix().
+        role_discrimination = check_role_discrimination_matrix(sc, containers)
+        results.append(role_discrimination)
+        if not role_discrimination.passed:
+            raise ComposeIntegrationError(f"role-discrimination matrix failed: {role_discrimination.detail}")
+        print(f"compose_integration: role-discrimination matrix: {role_discrimination.detail}")
+
     except ComposeIntegrationError as exc:
         print(f"compose_integration: FAIL: {exc}", file=sys.stderr)
         print()
@@ -563,12 +766,26 @@ def main() -> int:
             print_result(result)
         return 1
 
+    except _TerminatedError as exc:
+        # Closes Day 3 finding A-5: SIGTERM is now a controlled,
+        # diagnosed termination that still reaches `finally` below - never
+        # the interpreter's silent immediate death that previously left
+        # the full stack orphaned with an empty log.
+        print(f"compose_integration: TERMINATED: {exc}", file=sys.stderr)
+        print()
+        for result in results:
+            print_result(result)
+        return 143  # conventional 128+SIGTERM(15) - distinguishes "interrupted" from a normal FAIL(1)
+
     finally:
-        # Best-effort teardown regardless of how far `up` got - Compose's
-        # own `down -v` is a safe no-op against a project with nothing
-        # running, and this project name (and therefore its named volume,
-        # `<project>_state_data`) is unique to this run, so it never
-        # touches another Compose project or Docker resource.
+        # Best-effort teardown regardless of how far `up` got, and
+        # regardless of whether the try block exited normally, via
+        # ComposeIntegrationError, via _TerminatedError (SIGTERM), or via
+        # any other exception - Compose's own `down -v` is a safe no-op
+        # against a project with nothing running, and this project name
+        # (and therefore its named volume, `<project>_state_data`) is
+        # unique to this run, so it never touches another Compose project
+        # or Docker resource.
         down_result = compose(project, env, ["down", "-t", "10", "-v"], DOWN_TIMEOUT_SECONDS)
         if down_result.returncode != 0:
             print(
@@ -576,6 +793,7 @@ def main() -> int:
                 f"{project}: {down_result.stderr.strip()}",
                 file=sys.stderr,
             )
+        sys.stdout.flush()
 
     print()
     for result in results:

@@ -25,7 +25,7 @@ specific day's scope explicitly calls for an application change.
   closure of the Day 1 M-2 (PID 1/SIGTERM regression)/M-3 (Compose
   runtime verification) test-review findings. See
   `docs/compose-platform.md`.
-- **Day 3 (v0.3.0, this scope)** — networking, configuration, volumes,
+- **Day 3 (v0.3.0)** — networking, configuration, volumes,
   persistence: a new stdlib-only `state/` service (a durably persisted
   monotonic counter under a named Compose volume), extending the chain to
   `state -> app -> gateway`; two explicit Compose networks (`edge`:
@@ -36,7 +36,17 @@ specific day's scope explicitly calls for an application change.
   the `UPSTREAM_HOST`-vs-real-service cross-check, and the Compose-managed
   [D] read-only-write proof). See `docs/networking.md`,
   `docs/configuration.md`, and `docs/persistence.md`.
-- **Day 4** — build/image security and reproducibility.
+- **Day 4 (v0.4.0, this scope)** — build/image security and
+  reproducibility: a deterministic BuildKit/buildx release build
+  (`SOURCE_DATE_EPOCH`-normalized, verified byte-identical across two
+  independent builds), image-level application-source immutability
+  (root-owned, not writable by the runtime UID, independent of Compose's
+  `read_only: true`), a project-specific release-image policy audit
+  (`scripts/build/image_audit.py`), real SBOM generation (Syft) and
+  vulnerability scanning (Trivy) for the exact release image with both
+  scanners pinned by exact digest and never given the Docker socket, an
+  explicit vulnerability policy, and a multi-role chain smoke test. See
+  `docs/build-security.md` and `docs/supply-chain.md`.
 - **Day 5** — health, reliability, resource limits, observability.
 - **Day 6** — CI/CD, integration, release engineering.
 - **Day 7** — hardening, reviews, portfolio showcase -> v1.0.0.
@@ -51,25 +61,39 @@ implement a later day's scope early, even if it looks convenient.
   run Docker means something is wrong with the assumption, not a reason to
   add `sudo`.
 - **Never run a global prune** (`docker system prune`, `docker container
-  prune`, `docker image prune`, `docker volume prune`) or otherwise delete
-  Docker resources by broad prefix/heuristic matching. Every script in
-  this repository that creates a container uses a unique,
-  project-prefixed name (e.g. `maops-smoke-<uuid>`, `maops-security-
-  <uuid>`, or — for Compose-managed resources —
+  prune`, `docker image prune`, `docker volume prune`, `docker builder
+  prune`) or otherwise delete Docker resources by broad prefix/heuristic
+  matching. Every script in this repository that creates a container uses
+  a unique, project-prefixed name (e.g. `maops-smoke-<uuid>`,
+  `maops-security-<uuid>`, `maops-image-audit-<uuid>`,
+  `maops-repro-<uuid>-a`/`-b` (build/`reproducibility_check.py`'s two
+  disposable throwaway images/containers — never the real
+  `maops-docker-platform:<VERSION>` release image),
+  `maops-smoke-net-<uuid>` (a throwaway Docker *network*, for the
+  multi-role chain smoke test), or — for Compose-managed resources —
   `maops-compose-<uuid>` as the Compose *project* name) generated at run
-  time, and removes only that exact container/project in a
+  time, and removes only that exact container/network/image/project in a
   `finally`/equivalent block — never anything it didn't create.
 - `make clean` only removes known project-owned generated resources
-  (local `__pycache__`/cache directories, any leftover
-  `maops-smoke-*`/`maops-security-*` containers, and any leftover
-  `maops-compose-*` Compose projects together with their own named
-  volume, all matching this project's own deterministic naming scheme) —
-  never a broad prune, never another project's resources, and never the
-  named volume of a normal `docker compose up -d` development stack
-  (which uses no `-p maops-compose-*` project name).
+  (local `__pycache__`/cache directories, the `.cache/` scratch
+  directory, any leftover `maops-smoke-*`/`maops-security-*`/
+  `maops-image-audit-*` containers, any leftover `maops-smoke-net-*`
+  networks, any leftover `maops-repro-*` images/containers, and any
+  leftover `maops-compose-*` Compose projects together with their own
+  named volume, all matching this project's own deterministic naming
+  scheme) — never a broad prune, never another project's resources, and
+  never the named volume of a normal `docker compose up -d` development
+  stack (which uses no `-p maops-compose-*` project name).
 - The built release image (`maops-docker-platform:<VERSION>`) is left in
   place intentionally after validation; nothing in this repository's
   tooling removes it automatically.
+- SBOM/vulnerability-scanner containers (`scripts/security/`) are never
+  given the Docker socket and never scan the live daemon — they scan a
+  `docker save` archive of the exact release image instead, using scanner
+  images pinned by exact digest in `security/scanners.lock`. Generated
+  SBOM/vulnerability-report output lives only under `artifacts/`
+  (git-ignored); intermediate `docker save` archives are always cleaned
+  up within the same run that created them.
 - No Docker socket mounts, no `--privileged`, no `network_mode: host`,
   no `pid: host`, no host filesystem bind mount of arbitrary host data
   into any service container. The one narrow exception is Compose's own
@@ -115,10 +139,12 @@ distinction when extending security verification in later days.
 - Tests use loopback/in-process facilities and dynamic ports only; no
   fixed external ports, no public network, no shared mutable global test
   state, environment modifications restored on cleanup.
-- `scripts/lint/`, `scripts/smoke/`, `scripts/verify/`, `scripts/compose/`
-  are project-specific tools, not general-purpose scanners — each
-  documents its own real scope honestly in its own docstring/output
-  rather than implying broader coverage than it has.
+- `scripts/lint/`, `scripts/smoke/`, `scripts/verify/`, `scripts/compose/`,
+  `scripts/build/`, `scripts/security/` are project-specific tools, not
+  general-purpose scanners — each documents its own real scope honestly
+  in its own docstring/output rather than implying broader coverage than
+  it has. `scripts/security/` orchestrates real external scanners (Syft,
+  Trivy) rather than reimplementing SBOM/vulnerability scanning itself.
 - Every temporary validation container uses a unique, deterministic,
   project-prefixed name and is cleaned up via `try`/`finally` (or
   equivalent) on both success and failure paths.

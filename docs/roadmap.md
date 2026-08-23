@@ -1,6 +1,6 @@
 # Roadmap
 
-Seven-day portfolio arc. Only Days 1-3 are implemented; everything under
+Seven-day portfolio arc. Only Days 1-4 are implemented; everything under
 a later day below is **planned, not implemented** — do not read a later
 day's bullet list as describing current behavior.
 
@@ -153,11 +153,90 @@ day's bullet list as describing current behavior.
   engineering, CI, or container registry — all explicitly Day 4+ scope
   (see below).
 
-## Day 4 — Build/image security and reproducibility (planned)
+## Day 4 — Build/image security and reproducibility (v0.4.0, implemented)
 
-Vulnerability scanning, SBOM generation, and build-reproducibility
-verification for the image(s) that exist by that point. Multi-platform
-builds are a candidate but not committed.
+- **Runtime decision**: the originally planned `python:3.13-slim` runtime
+  was rejected after a real Trivy scan found 4 unfixed CRITICAL
+  `perl-base` findings (with no newer base digest available to resolve
+  them). `gcr.io/distroless/python3-debian13:nonroot` was adopted in its
+  place — same Python 3.13/Debian 13 family, no shell, no package
+  manager, no `perl-base` — and independently re-verified (real
+  vulnerability scan: 0 CRITICAL, 0 fixable HIGH; full runtime testing;
+  exact reproducibility) before adoption. `docker/app/Dockerfile` is now
+  a two-stage build: a digest-pinned `python:3.13-slim` builder
+  (filesystem preparation only) feeding the digest-pinned Distroless
+  final stage. See `docs/build-security.md`.
+- Every in-container probe across this project's tooling
+  (`scripts/verify/security_check.py`, `scripts/build/image_audit.py`,
+  `scripts/smoke/container_smoke.py`, `scripts/compose/
+  compose_integration.py`) now execs the absolute `/usr/bin/python3.13`
+  interpreter directly — never a shell, never a coreutils binary
+  (`sh`, `cat`, `id`, `find`, `stat`) — since the Distroless final
+  runtime has none of those.
+- A deliberate BuildKit/buildx-based deterministic release build
+  (`docker buildx build --output type=docker,rewrite-timestamp=true`,
+  `SOURCE_DATE_EPOCH` derived from the current commit timestamp, never
+  the wall clock) — two independent, clean, `--no-cache` builds from the
+  identical source tree produce a **byte-identical image ID**, verified
+  directly and independently corroborated by RootFS diff-ID equality,
+  Config/OCI-label equality, and a normalized content-addressed
+  filesystem manifest of `/app`
+  (`scripts/build/reproducibility_check.py`, `make reproducibility-check`).
+  See `docs/build-security.md`.
+- Image-level immutability: application source (`app/`, `gateway/`,
+  `state/`, `VERSION`) is now root-owned in the built image, not owned by
+  the non-root `10001:10001` runtime user — proven with a real attempted
+  write against a container started with *no* hardening flags at all
+  (not even `--read-only`), independent of and in addition to
+  `compose.yaml`'s runtime `read_only: true`. `/data` remains the one
+  deliberate exception, still writable by `10001:10001`.
+- `scripts/build/image_audit.py` (`make image-audit`) — a project-
+  specific release-image policy audit: exact tag/version, non-root
+  `Config.User`, a truthful OCI source label (cross-checked against the
+  real `git remote`), entrypoint/default command, all three service
+  packages present, `/data` ownership, the image-level immutability
+  proof, absence of repository-only/secret-shaped/setuid-setgid/
+  world-writable content, and (Day 4 Distroless-specific) real proof of
+  shell absence, package-manager absence, pip/setuptools absence, and the
+  expected `/usr/bin/python3.13` interpreter.
+- Real SBOM generation (Syft, SPDX JSON) and real vulnerability scanning
+  (Trivy, JSON) for the exact release image — both scanners pinned by
+  exact digest (`security/scanners.lock`), scanning a `docker save`
+  archive with the Docker socket never mounted into either scanner
+  container. `scripts/security/generate_sbom.py`/`check_sbom.py`
+  (`make sbom`/`sbom-check`) and `scripts/security/vuln_scan.py`/
+  `check_trivy_report.py` (`make vuln-scan`, `make supply-chain-check`)
+  enforce an explicit vulnerability policy (any CRITICAL, or any HIGH
+  with a fix available, fails the gate — no `.trivyignore`, no
+  manufactured exceptions), unweakened by the runtime migration. See
+  `docs/supply-chain.md`: the Distroless-based release image genuinely
+  **passes** vulnerability policy (Critical=0, fixable High=0), reported
+  alongside 15 unfixed-HIGH findings that remain (non-blocking under
+  policy) — the historical `python:3.13-slim` failure is preserved as the
+  documented reason the runtime changed, not as this release's result.
+- `scripts/smoke/container_smoke.py` gained a multi-role chain smoke test
+  (`state`+`app`+`gateway` from the one image, on a throwaway Docker
+  network, without Compose), closing the Day 3 Low finding that smoke
+  testing only ever covered the `app` role.
+- Closed six Day 3 review findings: A-1 (`schema_version` boolean-bypass
+  in all three `platform_config.py` modules — `True == 1` in Python), A-2
+  (`check_kernel_readonly_write_fails`'s liveness probe is now genuinely
+  role-aware, not hardcoded to `app.healthcheck`), A-3 (a real, live
+  `docker network inspect` proof for `backend`/`edge`'s `Internal` flag
+  was added to `compose_integration.py`, closing the doc/automation gap),
+  A-4 (`docs/compose-platform.md`'s stale `UPSTREAM_TIMEOUT_SECONDS`
+  reference corrected to `dependency_timeout_seconds`), A-5
+  (`compose_integration.py` now installs a real `SIGTERM` handler so a
+  mid-run termination still reaches its `finally` teardown, plus
+  line-buffered stdout so diagnostic output is never silently lost), and
+  a documentation-only clarification for A-6 (cross-hop timeout
+  stacking — the deeper reliability-engineering fix is deliberately left
+  to Day 5).
+- `VERSION` bumped `0.3.0` → `0.4.0`; the same version-consistency chain
+  extends with no new duplicated version literal.
+- Still no CI, no container registry, no cryptographic build provenance/
+  attestation/signing, no resource limits, no restart-policy engineering
+  — all explicitly Day 5+ scope (see below).
 
 ## Day 5 — Health/reliability/resources/observability (planned)
 

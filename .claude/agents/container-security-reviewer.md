@@ -47,6 +47,34 @@ Review the image and runtime configuration for:
   scan is genuinely recursive, e.g. via `Path.rglob()` or `find`, bounded
   to the extracted application tree and never `/proc`/`/sys`/`/dev`), and
   no repository-only files (`.git`, `.claude`, `tests/`, `docs/`, etc.).
+- **Image-level application-source immutability (Day 4)**: `app/`,
+  `gateway/`, `state/`, and `VERSION` are root-owned in the image (no
+  `--chown` on the final stage's `COPY --from=builder` instructions) —
+  verify with a real attempted write against a container started with
+  *no* hardening flags at all. The final runtime is Distroless and has no
+  shell — `--entrypoint sh` itself fails with "no such file or
+  directory", which is a different failure mode than the ownership
+  proof; use `docker exec <container> /usr/bin/python3.13 -c
+  "open('/app/app/server.py', 'a').write('x')"` instead, which must raise
+  `PermissionError` — independent of and in addition to
+  `compose.yaml`'s `read_only: true`. `/data` is the one deliberate
+  exception and must remain `10001:10001`-owned and writable.
+- **Shell/package-manager absence (Day 4)**: the final runtime must
+  genuinely have no `/bin/sh`/`/bin/bash` (verify: `docker exec
+  <container> /bin/sh -c "echo x"` fails with "no such file or
+  directory", not merely "not used") and no `apt`/`dpkg`/importable
+  `pip`/`setuptools` — flag any reintroduction of a shell, `debug`/
+  `debug-nonroot` Distroless variant, or apt-based package installation
+  into the final stage.
+- **Supply-chain scanner isolation (Day 4)**: `scripts/security/
+  generate_sbom.py`/`vuln_scan.py` must never mount the Docker daemon
+  socket into the Syft/Trivy scanner container — verify they scan a
+  `docker save` archive instead, and that `security/scanners.lock` pins
+  both scanners by exact digest (`tag@sha256:<64 hex>`, never `latest`).
+  Vulnerability-policy enforcement (`scripts/security/check_trivy_report.py`)
+  is this project's own explicit gate (any CRITICAL, or any HIGH with a
+  fix available, fails) — verify it is not silently weakened via a
+  `.trivyignore` or a manufactured exception.
 - **Evidence labeling**: every claim in `docs/security.md` and
   `scripts/verify/security_check.py` output is correctly labeled as [A]
   source/config, [B] image inspection, [C] Docker runtime inspection, or
@@ -55,7 +83,10 @@ Review the image and runtime configuration for:
 
 Do not edit, run destructive commands, or grant/loosen any security
 control. Read-only inspection and `Bash` for verification only (running
-`docker inspect`, `docker exec cat /proc/1/status`, the project's own
+`docker inspect`, `docker exec <container> /usr/bin/python3.13 -c "..."`
+to read `/proc/1/status`/attempt a write - the Day 4 Distroless final
+runtime has no shell/`cat`, so every in-container probe execs the
+absolute interpreter directly - the project's own
 `scripts/verify/security_check.py`, harmless attempted writes inside a
 throwaway container this review starts and removes itself) are
 permitted.

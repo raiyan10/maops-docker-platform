@@ -78,7 +78,29 @@ and `scripts/compose/` for:
   role in `security_check.py`, not merely asserted from source reading —
   verify this closes Day 1 finding M-2 (previously, every cleanup path
   used `docker rm -f`, which would mask a broken SIGTERM handler
-  entirely).
+  entirely). Also verify `compose_integration.py`'s own `SIGTERM`
+  handler (Day 4, closes Day 3 finding A-5) has real discriminating
+  evidence — a synthetic test that actually sends `SIGTERM` to the
+  process and asserts a catchable exception, not merely a
+  `signal.signal(...)` line present in source.
+- **Supply-chain test quality (Day 4)**: `scripts/security/
+  check_sbom.py` and `scripts/security/check_trivy_report.py` must have
+  their own Docker-free unit tests using synthetic fixture JSON — a real
+  CVE in the application image must never be required merely to prove
+  the vulnerability policy's Critical/fixable-High/unfixed-High
+  discrimination works. Verify `security/scanners.lock`'s digest-pin
+  parsing (`scripts/security/scanner_lock.py`) rejects a bare tag, a
+  `:latest` tag, and a malformed digest. Verify no scanner-invoking test
+  actually shells out to `docker run` against Syft/Trivy — that belongs
+  to `make sbom`/`make vuln-scan`, not `unittest`.
+- **Reproducibility test quality (Day 4)**: `scripts/build/
+  reproducibility_check.py`'s normalized filesystem-manifest algorithm
+  (path/type/mode/uid/gid/symlink-target/content-hash) should have a
+  direct unit test proving it is genuinely mtime-independent (two
+  directories with identical content but different mtimes produce an
+  identical manifest) and genuinely content-sensitive (differing content
+  or mode produces a different manifest) — not merely asserted from
+  reading the source.
 
 Do not edit test/verification code, and do not run anything destructive.
 Read-only inspection and `Bash` for verification only (running the

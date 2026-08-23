@@ -104,8 +104,10 @@ def _route_root(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
 
 def _route_healthz(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
     # Liveness only: proves the gateway's own process/event loop is
-    # responsive. Never calls the upstream - that is /readyz's job.
-    return 200, {"status": "ok"}
+    # responsive. Never calls the upstream - that is /readyz's job. "role"
+    # identifies which MAOps workload is answering, so a healthcheck probe
+    # can reject a response from the wrong service (Day 4 finding H-1).
+    return 200, {"status": "ok", "role": "gateway"}
 
 
 def _route_readyz(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:

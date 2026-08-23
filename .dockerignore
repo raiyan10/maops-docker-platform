@@ -32,6 +32,20 @@ screenshots/**
 **/*.gif
 **/*.svg
 
+# Day 4: generated build/security artifacts, scanner output, saved Docker
+# archives, and scratch working directories - never part of the
+# application image. security/ itself (scanners.lock, a small tracked
+# non-secret pin file) is excluded too - it's a repo-governance file, not
+# application runtime content.
+artifacts
+artifacts/**
+.cache
+.cache/**
+security
+security/**
+**/*.tar
+**/*.tar.gz
+
 # Build/dist output
 build/**
 dist/**

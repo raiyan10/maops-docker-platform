@@ -62,8 +62,13 @@ influenced by anything in an incoming request's path, query string,
 headers, or body - there is no arbitrary-URL proxying and no
 user-controlled upstream host, which is what prevents this gateway from
 being an SSRF-style open proxy. Every outbound call uses a single bounded
-socket timeout (`UPSTREAM_TIMEOUT_SECONDS`, 3s) covering both connect and
-read, so the gateway can never hang indefinitely waiting on `app`. No
+socket timeout (`dependency_timeout_seconds`, sourced from the
+Compose-mounted `config/platform.json`, default `3.0`s, live-changeable
+via a container recreation with no image rebuild - see
+`docs/configuration.md`; this replaced the Day 2 hardcoded
+`UPSTREAM_TIMEOUT_SECONDS` constant in Day 3, closing Day 3 finding A-4,
+`day-03-security-review.md` L-3) covering both connect and read, so the
+gateway can never hang indefinitely waiting on `app`. No
 Python traceback or raw network-exception text is ever returned to a
 client - connection failures, non-200 upstream statuses, and malformed
 upstream JSON are all converted to a controlled `503` (`/readyz`) or
@@ -88,13 +93,15 @@ is simply another HTTP client, over the Compose network. See
 
 `docker/app/Dockerfile` builds a single image
 (`maops-docker-platform:<VERSION>`) containing `app/`, `gateway/`, and
-`state/`. `ENTRYPOINT ["python3"]` (exec form, still PID 1 directly - no
-shell wrapper) with `CMD ["-m", "app"]` as the image-level default;
+`state/`. `ENTRYPOINT ["/usr/bin/python3.13"]` (exec form, the absolute
+interpreter path, still PID 1 directly - no shell wrapper; Day 4: the
+final runtime is Distroless and has no shell to resolve a bare `python3`
+name against) with `CMD ["-m", "app"]` as the image-level default;
 `compose.yaml` overrides `command: ["-m", "gateway"]` / `command: ["-m",
-"state"]` for those services. All three roles run `python3` directly as
-PID 1 - proven, not just declared, by `scripts/compose/
-compose_integration.py`'s `/proc/1/cmdline` inspection of every
-Compose-created container.
+"state"]` for those services. All three roles run `/usr/bin/python3.13`
+directly as PID 1 - proven, not just declared, by `scripts/compose/
+compose_integration.py`'s `/proc/1/cmdline` inspection (via a stdlib-only
+Python probe, no `cat`) of every Compose-created container.
 
 ## Explicit networks and service-name discovery
 
@@ -125,9 +132,10 @@ distinguish a real ordering guarantee from timing luck.
 
 - **Health** (`HEALTHCHECK`, Docker/Compose-level): "is this container's
   own process alive and responding?" `app`'s healthcheck is
-  `python3 -m app.healthcheck`, `gateway`'s is `python3 -m
-  gateway.healthcheck`, `state`'s is `python3 -m state.healthcheck` -
-  each probes only its own `/healthz`, liveness only, never a dependency.
+  `/usr/bin/python3.13 -m app.healthcheck`, `gateway`'s is
+  `/usr/bin/python3.13 -m gateway.healthcheck`, `state`'s is
+  `/usr/bin/python3.13 -m state.healthcheck` - each probes only its own
+  `/healthz`, liveness only, never a dependency.
   A single image can only declare one `HEALTHCHECK`, so `compose.yaml`
   overrides it per-service; all three invocation forms are
   regression-tested (see below).
@@ -212,15 +220,35 @@ against an ad hoc `docker run` container. `state` additionally proves its
 one exception - `/data`, via the named volume - is genuinely writable
 despite the same read-only rootfs (see `docs/persistence.md`).
 
-## What is explicitly not implemented yet (Day 4+)
+## Day 4 additions to this file's scope
+
+`compose_integration.py` gained three Day 4 changes, all still within
+this document's existing scope (runtime platform behavior, not supply-
+chain scanning, which lives entirely in `scripts/security/` - see
+`docs/supply-chain.md`):
+
+- `check_kernel_readonly_write_fails`'s "service kept serving" probe is
+  now genuinely role-aware (`role=name` dispatches to
+  `state.healthcheck`/`app.healthcheck`/`gateway.healthcheck` per
+  container), closing Day 3 finding A-2.
+- A real, live `docker network inspect` proof that `backend.Internal ==
+  true` and `edge.Internal == false`, closing Day 3 finding A-3 - see
+  `docs/networking.md`.
+- A `SIGTERM` handler (`_install_sigterm_handler()`), so a mid-run
+  termination now reaches the script's own `finally` teardown instead of
+  silently orphaning the stack, closing Day 3 finding A-5.
+
+## What is explicitly not implemented yet (Day 5+)
 
 - No CPU/memory resource limits or restart-policy reliability
   engineering - Day 5.
 - No CI-enforced verification - Day 6; `make release-check` is the only
   gate today.
-- No vulnerability scanning, SBOM, or build-reproducibility framework
-  beyond `VERSION` consistency - Day 4.
 - No container registry or published image - Day 6.
+- No cryptographic build provenance/attestation/signing - deferred past
+  Day 4, see `docs/build-security.md`.
 
 Do not read any bullet in this section as already implemented - see
-`docs/roadmap.md` for the authoritative day-by-day scope.
+`docs/roadmap.md` for the authoritative day-by-day scope. Day 4
+(`docs/build-security.md`, `docs/supply-chain.md`) is implemented as of
+this document's current revision.

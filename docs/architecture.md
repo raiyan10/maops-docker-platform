@@ -87,14 +87,19 @@ it.
 `app`, `gateway`, and `state` all run **directly as PID 1** inside their
 respective containers, from the same image:
 
-- `ENTRYPOINT ["python3"]` in exec form — no shell wrapper, no `sh -c`,
-  no process manager (no supervisord/tini/dumb-init) — with
-  `CMD ["-m", "app"]` as the image-level default; `compose.yaml`
-  overrides `command: ["-m", "gateway"]` / `command: ["-m", "state"]` for
-  those services. Every service's `command:` is explicit in
-  `compose.yaml`, matching this default. `gateway/server.py` and
-  `state/server.py` both mirror `app/server.py`'s process model exactly,
-  so all three roles share the same lifecycle guarantees.
+- `ENTRYPOINT ["/usr/bin/python3.13"]` in exec form — the absolute
+  interpreter path, no shell wrapper, no `sh -c`, no process manager (no
+  supervisord/tini/dumb-init) — with `CMD ["-m", "app"]` as the
+  image-level default; `compose.yaml` overrides `command: ["-m",
+  "gateway"]` / `command: ["-m", "state"]` for those services. Every
+  service's `command:` is explicit in `compose.yaml`, matching this
+  default. `gateway/server.py` and `state/server.py` both mirror
+  `app/server.py`'s process model exactly, so all three roles share the
+  same lifecycle guarantees. As of Day 4, the final runtime
+  (`gcr.io/distroless/python3-debian13:nonroot`) has no shell at all, so
+  the absolute path is a hard requirement, not a style choice — a bare
+  `python3` name would depend on PATH resolution the runtime cannot
+  perform. See `docs/build-security.md`.
 - No daemonization: `serve_forever()` blocks in the foreground for the
   lifetime of the container, for every role.
 - All logging goes to stdout (`log_message` is overridden to write to
@@ -123,11 +128,28 @@ flushed immediately rather than buffered until process exit.
 ## Docker vs. Compose responsibility
 
 - **`docker/app/Dockerfile`** owns everything about what the image *is*:
-  base image, non-root user, file layout (including pre-creating `/data`,
-  owned by the non-root user, so a fresh `state_data` volume works
-  without a privileged init step — see `docs/persistence.md`), the
+  base image(s), non-root user, file layout (including pre-creating
+  `/data`, owned by the non-root user, so a fresh `state_data` volume
+  works without a privileged init step — see `docs/persistence.md`), the
   `app`-role `HEALTHCHECK` default, OCI labels, the exec-form
-  `ENTRYPOINT`/default `CMD`.
+  `ENTRYPOINT`/default `CMD`. As of Day 4, it also owns application
+  source's *ownership* as a security property: `app/`, `gateway/`,
+  `state/`, and `VERSION` are root-owned (no `--chown` on the final
+  stage's `COPY --from=builder` instructions), not owned by the non-root
+  `10001:10001` runtime user — an image-level immutability property
+  independent of `compose.yaml`'s runtime `read_only: true`. See
+  `docs/build-security.md`.
+  **Day 4 build architecture**: the Dockerfile is now a two-stage build —
+  a digest-pinned `python:3.13-slim` builder stage (filesystem
+  preparation only: copies application source, creates and owns `/data`;
+  never entering the final image itself) feeding a digest-pinned
+  `gcr.io/distroless/python3-debian13:nonroot` final runtime stage (no
+  shell, no package manager). This is a *build-image* architecture
+  change only — the runtime service topology (`state -> app -> gateway`,
+  one image capable of all three roles) is unchanged from Day 3. See
+  `docs/build-security.md` for the full rationale and the base-image
+  rejection this replaced (`python:3.13-slim`, rejected on unfixed
+  CRITICAL findings).
 - **`compose.yaml`** owns everything about how the image is *run*: which
   role each service plays (`command:`), port mapping (`app`/`state`:
   none; `gateway`: loopback-only), environment variables, the per-role
@@ -157,3 +179,10 @@ one-level glob — a real prior review finding was a non-recursive pattern
 that let a nested `__pycache__` directory leak into the image. See
 `docs/security.md` for the recursive-verification proof, not just the
 pattern's presence.
+
+As of Day 4, `.dockerignore` also excludes the new generated-artifact
+directories (`artifacts/`, `.cache/`), the `security/` directory (a
+repo-governance file, `scanners.lock` — not application runtime content),
+and any `.tar`/`.tar.gz` file — so a saved Docker image archive or a
+generated SBOM/vulnerability report can never itself leak into a
+subsequent build. See `docs/supply-chain.md`.

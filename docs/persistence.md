@@ -142,6 +142,20 @@ against a real stack under a uniquely named Compose project:
   scope note. Within Compose, `state`/`app`/`gateway` always resolve (or
   fail fast with connection-refused), so this does not affect the
   documented failure/recovery behavior above.
+- Cross-hop timeout stacking (Day 3 finding A-6,
+  `day-03-networking-review.md` M-1): `gateway`'s and `app`'s
+  `dependency_timeout_seconds` budgets are each applied independently to
+  their own hop, with no awareness of how much of that budget the hop
+  below has already spent. During a `state` outage, the outermost caller's
+  effective worst-case failure-detection latency can be up to ~2x the
+  advertised single-hop `dependency_timeout_seconds` (3.0s default), not
+  1x - an external client/monitor with a timeout near that single-hop
+  value could observe a raw connection timeout instead of `gateway`'s
+  intended clean `503`. This is a latency characteristic, not a
+  segmentation or correctness defect - `app`/`gateway` both stay alive and
+  eventually answer correctly either way. Nesting the per-hop budgets
+  (rather than each hop reusing the same value) is Day 5 reliability-
+  engineering scope, not addressed here.
 - No resource limits, no CPU/memory constraints, no restart-policy
   reliability engineering - Day 5 scope.
 - No multi-replica state, no distributed consensus - explicitly out of

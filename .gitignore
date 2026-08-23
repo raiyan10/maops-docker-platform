@@ -27,3 +27,10 @@ htmlcov/
 *.log
 .env
 .env.*
+
+# Day 4: generated build/security artifacts and scratch working dirs -
+# never committed. security/scanners.lock itself IS tracked (small,
+# public, no credentials) - only these generated-output locations are
+# ignored. See docs/build-security.md / docs/supply-chain.md.
+artifacts/
+.cache/
