@@ -1,35 +1,58 @@
 #!/usr/bin/env python3
-"""Project-specific source validator for the app/, gateway/, and state/ packages.
+"""Project-specific source validator for the app/, gateway/, state/, and
+(Day 4) scripts/build/, scripts/security/ packages.
 
 SCOPE (read this before trusting the result): this is a small, deliberately
 narrow AST-based check for a short, explicit list of constructs that would
-be inappropriate in this project's tiny stdlib HTTP workload/gateway/state
-service. It is **not** a general-purpose static security scanner, does not
-understand data flow, and does not replace a real tool (e.g. Bandit,
-Semgrep) for a larger codebase. It only scans `app/`, `gateway/`, and
-`state/` — the actual runtime service source — never `scripts/` (which
-legitimately uses `subprocess` to drive Docker) or `tests/`.
+be inappropriate in this project's source. It is **not** a general-purpose
+static security scanner, does not understand data flow, and does not
+replace a real tool (e.g. Bandit, Semgrep) for a larger codebase.
 
-Legitimate stdlib HTTP networking (`http.client`, `socket`, `urllib.parse`)
-is never flagged — the gateway's/app's whole job is making real, bounded
-outbound HTTP calls to a fixed configured upstream. What remains forbidden
-is shell/process execution and other constructs no honest HTTP
-client/server needs.
+Two different rule sets apply, because the *workload* and the *tooling*
+have genuinely different legitimate needs — narrowing one to fit the
+other would either be pointlessly strict (tooling has no legitimate need
+for `subprocess`... except that it does, since it drives Docker) or
+dangerously loose (the application workload has no legitimate need for
+process/shell execution at all):
+
+  * **Workload** (`app/`, `gateway/`, `state/` — the actual runtime HTTP
+    services): `subprocess`/`pickle`/`ctypes` imports are forbidden
+    outright. Legitimate stdlib HTTP networking (`http.client`, `socket`,
+    `urllib.parse`) is never flagged — the gateway's/app's whole job is
+    making real, bounded outbound HTTP calls to a fixed configured
+    upstream. `scripts/compose/`, `scripts/lint/`, `scripts/smoke/`,
+    `scripts/verify/`, and `tests/` are never scanned by either rule set
+    below — they are Docker-driving/test infrastructure, not workload or
+    the two Day 4 directories this scan was deliberately widened to.
+  * **Tooling** (`scripts/build/`, `scripts/security/` — Day 4's Docker/
+    scanner-driving infrastructure): `subprocess` is explicitly permitted
+    (both directories' whole job is invoking `docker build`/`docker run`/
+    the pinned Syft/Trivy scanner containers) — but `pickle`/`ctypes` are
+    still forbidden (neither directory has any legitimate need for
+    either), and every check below that isn't import-based (eval/exec/
+    os.system/os.popen/shell=True) applies identically to both rule sets.
+    Widening this scan to the tooling directories does not weaken the
+    workload's own restrictions in any way — the two rule sets are kept
+    genuinely separate, not merged into one relaxed policy.
 
 Checks performed, each via the `ast` module (never naive substring
 matching, so e.g. a string literal or a comment mentioning "eval" never
 trips a finding):
 
-  * no `eval`/`exec`/`compile`/`__import__` calls
-  * no `import subprocess` / `import pickle` / `import ctypes`
+  * no `eval`/`exec`/`compile`/`__import__` calls (both rule sets)
+  * no `import subprocess` / `import pickle` / `import ctypes` (workload);
+    no `import pickle` / `import ctypes` (tooling — `subprocess` allowed)
   * no `os.system(...)` / `os.popen(...)` calls — including through a
     single-hop import alias (`import os as x; x.system(...)`) or a
     `from os import system as x; x(...)` rebinding, both tracked via each
     file's own module-level `Import`/`ImportFrom` statements (closes the
     Day 1/2 carried-forward finding L-1: a prior version only matched a
     literal `os.system(...)` call, so a one-line aliasing rename bypassed
-    it entirely)
-  * no call anywhere passing `shell=True`
+    it entirely) — both rule sets, since even `subprocess`-using tooling
+    has no legitimate need for a shell-string `os.system`/`os.popen` call
+  * no call anywhere passing `shell=True` (both rule sets — tooling's
+    `subprocess.run([...])` calls always use an argv list, never a shell
+    string)
 """
 
 from __future__ import annotations
@@ -38,7 +61,8 @@ import ast
 import sys
 from pathlib import Path
 
-FORBIDDEN_MODULES = {"subprocess", "pickle", "ctypes"}
+WORKLOAD_FORBIDDEN_MODULES = {"subprocess", "pickle", "ctypes"}
+TOOLING_FORBIDDEN_MODULES = {"pickle", "ctypes"}
 FORBIDDEN_CALL_NAMES = {"eval", "exec", "compile", "__import__"}
 FORBIDDEN_OS_ATTRS = {"system", "popen"}
 
@@ -119,7 +143,7 @@ def _check_call(
     return findings
 
 
-def check_file(path: Path) -> list[Finding]:
+def check_file(path: Path, forbidden_modules: set[str]) -> list[Finding]:
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     findings: list[Finding] = []
@@ -129,12 +153,12 @@ def check_file(path: Path) -> list[Finding]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root_module = alias.name.split(".")[0]
-                if root_module in FORBIDDEN_MODULES:
+                if root_module in forbidden_modules:
                     findings.append(
                         Finding(path, node.lineno, f"forbidden import: {alias.name}")
                     )
         elif isinstance(node, ast.ImportFrom):
-            if node.module and node.module.split(".")[0] in FORBIDDEN_MODULES:
+            if node.module and node.module.split(".")[0] in forbidden_modules:
                 findings.append(
                     Finding(path, node.lineno, f"forbidden import: {node.module}")
                 )
@@ -144,24 +168,39 @@ def check_file(path: Path) -> list[Finding]:
     return findings
 
 
-def main() -> int:
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    scan_dirs = [repo_root / "app", repo_root / "gateway", repo_root / "state"]
-
+def _collect_files(scan_dirs: list[Path]) -> list[Path]:
     files: list[Path] = []
     for scan_dir in scan_dirs:
         if not scan_dir.exists():
-            print(f"no such directory: {scan_dir}", file=sys.stderr)
-            return 1
+            raise FileNotFoundError(str(scan_dir))
         files.extend(sorted(scan_dir.rglob("*.py")))
+    return files
 
-    if not files:
-        print(f"no Python files found under {scan_dirs}", file=sys.stderr)
+
+def main() -> int:
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    workload_dirs = [repo_root / "app", repo_root / "gateway", repo_root / "state"]
+    tooling_dirs = [repo_root / "scripts" / "build", repo_root / "scripts" / "security"]
+
+    try:
+        workload_files = _collect_files(workload_dirs)
+        tooling_files = _collect_files(tooling_dirs)
+    except FileNotFoundError as exc:
+        print(f"no such directory: {exc}", file=sys.stderr)
+        return 1
+
+    if not workload_files:
+        print(f"no Python files found under {workload_dirs}", file=sys.stderr)
+        return 1
+    if not tooling_files:
+        print(f"no Python files found under {tooling_dirs}", file=sys.stderr)
         return 1
 
     all_findings: list[Finding] = []
-    for path in files:
-        all_findings.extend(check_file(path))
+    for path in workload_files:
+        all_findings.extend(check_file(path, WORKLOAD_FORBIDDEN_MODULES))
+    for path in tooling_files:
+        all_findings.extend(check_file(path, TOOLING_FORBIDDEN_MODULES))
 
     if all_findings:
         print(f"check_source.py: {len(all_findings)} finding(s):")
@@ -169,8 +208,12 @@ def main() -> int:
             print(f"  {finding}")
         return 1
 
-    scanned_names = "/, ".join(d.name for d in scan_dirs) + "/"
-    print(f"check_source.py: OK ({len(files)} file(s) scanned under {scanned_names})")
+    workload_names = "/, ".join(d.name for d in workload_dirs) + "/"
+    tooling_names = ", ".join(f"scripts/{d.name}/" for d in tooling_dirs)
+    print(
+        f"check_source.py: OK ({len(workload_files)} workload file(s) scanned under "
+        f"{workload_names}; {len(tooling_files)} tooling file(s) scanned under {tooling_names})"
+    )
     return 0
 
 

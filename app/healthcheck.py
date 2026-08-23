@@ -1,7 +1,10 @@
 """Stdlib-only Docker HEALTHCHECK probe. No curl/wget dependency.
 
 Connects to the app's own /healthz endpoint over loopback and exits 0 only
-on an HTTP 200 with the expected JSON body. Uses http.client (not
+on an HTTP 200 with the expected JSON body AND role=="app" - a bare
+{"status": "ok"} from some other MAOps service listening on the same port
+(e.g. during a role misconfiguration) must not be accepted as this
+service's own liveness (Day 4 finding H-1). Uses http.client (not
 urllib.request) to avoid any proxy-environment-variable interference.
 """
 
@@ -14,6 +17,7 @@ import sys
 from app.config import DEFAULT_PORT, load_config
 
 TIMEOUT_SECONDS = 2.0
+EXPECTED_ROLE = "app"
 
 
 def check() -> bool:
@@ -37,7 +41,10 @@ def check() -> bool:
     except json.JSONDecodeError:
         return False
 
-    return payload.get("status") == "ok"
+    if not isinstance(payload, dict):
+        return False
+
+    return payload.get("status") == "ok" and payload.get("role") == EXPECTED_ROLE
 
 
 if __name__ == "__main__":

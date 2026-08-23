@@ -73,16 +73,26 @@ Review `compose.yaml` for:
   volume behind for that project. `scripts/compose/compose_integration.py`
   (`make compose-test`) automates this whole scenario — treat a manual
   re-run as cross-verification, not the only evidence.
-- **Day 4+ fitness**: is the current structure simple enough to extend
+- **Day 4 harness robustness**: `scripts/compose/compose_integration.py`
+  registers a real `SIGTERM` handler (`_install_sigterm_handler()`) so a
+  mid-run termination still reaches its own `finally` teardown, and its
+  reused `check_kernel_readonly_write_fails` call is role-aware
+  (`role=name`, dispatching to each container's own healthcheck module,
+  not a hardcoded `app.healthcheck`) — verify neither regresses. Also
+  verify the real, live `docker network inspect` proof of `backend`/
+  `edge`'s `Internal` flag (`check_network_internal_flag`) still runs
+  against the actual running network object, not merely the rendered
+  config `check_compose.py` already checks.
+- **Day 5+ fitness**: is the current structure simple enough to extend
   (resource limits, restart policies, CI-driven verification) without a
   rewrite — without you actually adding any of that now. Flag structural
   choices that would make later growth awkward, but do not implement
   later-day scope yourself.
 
-Do not edit `compose.yaml`, and do not implement any Day 4+ functionality
+Do not edit `compose.yaml`, and do not implement any Day 5+ functionality
 (resource limits, restart-policy engineering, CI, registry publishing)
 even if it seems like a natural extension — that is explicitly out of
-scope for this agent and for Day 3. Read-only inspection and `Bash` for
+scope for this agent and for Day 4. Read-only inspection and `Bash` for
 verification only (`docker compose config`, `scripts/compose/
 check_compose.py`, `scripts/compose/compose_integration.py`, `docker
 compose up -d` / `down` against this project's own uniquely-named
@@ -99,7 +109,7 @@ state.
 6. **Security restriction findings**.
 7. **Health dependency and startup-ordering findings**.
 8. **Lifecycle findings** (up/functional/down, resource cleanliness).
-9. **Day 4+ fitness notes** (observations only, not implementation).
+9. **Day 5+ fitness notes** (observations only, not implementation).
 10. **Recommended remediation order**, most critical first.
 
 End with a one-line verdict: Compose platform sound, or blocked pending

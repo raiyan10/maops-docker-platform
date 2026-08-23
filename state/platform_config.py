@@ -92,7 +92,7 @@ def load_platform_config(
         raise ValueError(f"platform config at {config_path} must be a JSON object, got {type(data).__name__}")
 
     schema_version = data.get("schema_version")
-    if schema_version != SCHEMA_VERSION:
+    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
         raise ValueError(
             f"platform config 'schema_version' must be {SCHEMA_VERSION}, got {schema_version!r}"
         )

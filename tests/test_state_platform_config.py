@@ -56,6 +56,21 @@ class LoadPlatformConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_platform_config(path=path)
 
+    def test_schema_version_true_is_rejected(self) -> None:
+        """bool is a subclass of int in Python - True == 1 must not pass as schema_version 1."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text('{"schema_version": true}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_platform_config(path=path)
+
+    def test_schema_version_false_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text('{"schema_version": false}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_platform_config(path=path)
+
     def test_missing_schema_version_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "platform.json"

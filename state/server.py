@@ -53,7 +53,9 @@ def _route_root(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
 def _route_healthz(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:
     # Liveness only: proves the state process's own event loop is
     # responsive. Never touches the persisted store - that is /readyz's job.
-    return 200, {"status": "ok"}
+    # "role" identifies which MAOps workload is answering, so a healthcheck
+    # probe can reject a response from the wrong service (Day 4 finding H-1).
+    return 200, {"status": "ok", "role": "state"}
 
 
 def _route_readyz(handler: "JSONRequestHandler") -> tuple[int, dict[str, object]]:

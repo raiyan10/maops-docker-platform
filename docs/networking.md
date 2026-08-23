@@ -83,7 +83,15 @@ a real running stack:
   assumption from network membership looking correct on paper.
 - Each container's actual `NetworkSettings.Networks` membership (via
   `docker inspect`) matches the declared `edge`/`backend` topology.
-- `backend`'s real `docker network inspect` output shows `Internal: true`.
+- `backend`'s real, live `docker network inspect` output shows
+  `Internal: true`, and `edge`'s shows `Internal: false`
+  (`check_network_internal_flag()`) - a genuine `[C]`-tier check against
+  the running Docker network object itself, not the `[A]`-tier check
+  `scripts/compose/check_compose.py` already performs against the
+  *rendered* `compose.yaml`. Day 4 added this specific check
+  (`docs/engineering-reviews/day-03-security-review.md` finding M-2/A-3
+  correctly found that, on Day 3, this exact bullet described a proof that
+  did not yet exist in `compose_integration.py` - it does now).
 - The end-to-end `gateway -> app -> state` HTTP path (`GET /state`,
   `POST /state/increment`) genuinely works across both networks.
 

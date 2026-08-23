@@ -5,7 +5,7 @@ description: Reusable MAOps Docker release discipline for maops-docker-platform 
 
 # Release Readiness
 
-Reusable release procedure. As of Day 3, no CI and no container registry
+Reusable release procedure. As of Day 4, no CI and no container registry
 exist — do not claim otherwise, and do not scaffold either early. Steps
 that reference a PR/tag/release describe the eventual full-portfolio
 process; this repository's own current-day rule (see `.claude/CLAUDE.md`)
@@ -19,8 +19,11 @@ from the user in that conversation.**
    chain.
 
 2. **Build** — `make build`. Builds `maops-docker-platform:<VERSION>`
-   from `docker/app/Dockerfile`, `VERSION`-derived, never `latest`. See
-   `docker-build-validation` for the full build/inspection procedure.
+   from `docker/app/Dockerfile` (Day 4: a two-stage build — a
+   `python:3.13-slim` builder feeding a Distroless
+   `gcr.io/distroless/python3-debian13:nonroot` final runtime),
+   `VERSION`-derived, never `latest`. See `docker-build-validation` for
+   the full build/inspection procedure.
 
 3. **Inspect** — `make inspect`. Captures `docker image inspect`/`ls`/
    `history` output; record the canonical size metric used, without
@@ -43,46 +46,84 @@ from the user in that conversation.**
    automated `make release-check` chain: it runs the real three-service
    stack under a uniquely named project, proves the health-gated
    `state -> app -> gateway` startup ordering, real network isolation
-   (`gateway`<->`state` unreachable both directions), the full
-   `gateway -> app -> state` persistence path (including survival across
-   container recreation and a full `compose down`/`up` cycle with the
-   volume retained), the state-stop/degrade, state-start/recover
-   scenario, and inspects the real Compose-created containers' hardening
-   (including a real [D] rootfs-write-rejection proof for every
-   container) — this closes the Day 1 gap where Compose verification was
-   manual-only (see `compose-validation`). Still worth a manual
-   walkthrough at least once per release for a human-observed sanity
-   check, but it is no longer the only evidence.
+   (`gateway`<->`state` unreachable both directions, plus - Day 4 - a
+   real, live `docker network inspect` proof of `backend`/`edge`'s
+   `Internal` flag), the full `gateway -> app -> state` persistence path
+   (including survival across container recreation and a full
+   `compose down`/`up` cycle with the volume retained), the
+   state-stop/degrade, state-start/recover scenario, and inspects the
+   real Compose-created containers' hardening (including a real,
+   role-aware [D] rootfs-write-rejection proof for every container). A
+   real `SIGTERM` sent mid-run is now caught and still runs the script's
+   own teardown (Day 4, closes Day 3 finding A-5) — this closes the Day 1
+   gap where Compose verification was manual-only (see
+   `compose-validation`). Still worth a manual walkthrough at least once
+   per release for a human-observed sanity check, but it is no longer the
+   only evidence.
 
-7. **Independent reviews** — before treating a version as release-ready,
+7. **Image audit and reproducibility (Day 4)** — `make image-audit`
+   (`scripts/build/image_audit.py`) validates release-image-specific
+   invariants (exact tag/version, non-root user, truthful OCI metadata,
+   all three service packages present, `/data` ownership, image-level
+   application-source immutability, absence of repository-only/secret-
+   shaped/setuid-setgid/world-writable content, and Distroless-specific
+   proof of shell absence, package-manager absence, pip/setuptools
+   absence, and the expected `/usr/bin/python3.13` interpreter). `make
+   reproducibility-check` (`scripts/build/reproducibility_check.py`)
+   independently proves two clean builds from the identical source tree
+   produce the same image ID — treat a claimed "reproducible build" as
+   unproven until this actually runs and passes.
+
+8. **Supply chain (Day 4)** — `make sbom`/`sbom-check` (Syft, SPDX JSON)
+   and `make vuln-scan` (Trivy, JSON) scan the exact release image via a
+   `docker save` archive, using scanner images pinned by exact digest in
+   `security/scanners.lock`, neither ever given the Docker socket.
+   `vuln-scan` enforces an explicit policy (any CRITICAL, or any HIGH
+   with a fix available, fails the gate) — see `docs/supply-chain.md`:
+   the Distroless-based release image genuinely **passes** this policy
+   (Critical=0, fixable High=0), with 15 unfixed-High findings reported
+   non-blocking. Treat the specific counts as scan-time values (Trivy's
+   database changes over time), not a timeless guarantee — re-run before
+   trusting them again. `make supply-chain-check` composes `sbom` +
+   `sbom-check` + `vuln-scan` as one convenience target outside
+   `release-check`'s own chain.
+
+9. **Independent reviews** — before treating a version as release-ready,
    route the diff through the relevant project agents
    (`docker-architect`, `container-security-reviewer`,
    `compose-platform-engineer`, `docker-test-engineer`,
    `release-engineer`) for a second opinion beyond the automated checks.
 
-8. **Blocker remediation** — fix anything a review or check flagged, then
-   re-run the affected steps (not just the one that failed — a fix can
-   have side effects on earlier steps).
+10. **Blocker remediation** — fix anything a review or check flagged,
+    then re-run the affected steps (not just the one that failed — a fix
+    can have side effects on earlier steps). A genuinely unavoidable
+    vulnerability-policy finding (no fix available, base digest already
+    current) is reported and the gate is left failing, per
+    `.claude/CLAUDE.md` — never silenced via a `.trivyignore` or a
+    loosened policy threshold.
 
-9. **`make release-check`** — the single composed gate (`quality
-   (test -> lint -> dockerfile-check -> compose-check) -> build -> inspect
-   -> smoke -> security-check -> compose-test`). Every failure must
-   propagate; nothing in this chain may silently swallow a nonzero exit
-   code.
+11. **`make release-check`** — the single composed gate (`quality
+    (test -> lint -> dockerfile-check -> compose-check) -> build ->
+    inspect -> image-audit -> smoke -> security-check -> compose-test ->
+    reproducibility-check -> sbom -> sbom-check -> vuln-scan`). Every
+    failure must propagate; nothing in this chain may silently swallow a
+    nonzero exit code.
 
-10. **PR** — only when the user explicitly asks for one. Do not create a
+12. **PR** — only when the user explicitly asks for one. Do not create a
     GitHub repository, PR, tag, or release on your own initiative.
 
-11. **Merged-main validation** — once a PR exists and is merged (future
+13. **Merged-main validation** — once a PR exists and is merged (future
     day, explicit instruction only), re-run this entire procedure against
     `main` before tagging — a passing PR branch is not itself proof that
     `main` post-merge is releasable.
 
-12. **Tag/release** — only when the user explicitly asks for it, and only
-    after step 11 passes on `main`.
+14. **Tag/release** — only when the user explicitly asks for it, and only
+    after step 13 passes on `main`.
 
 ## What this skill does not cover
 
 Publishing to a registry (GHCR, Docker Hub) and CI workflow configuration
 are explicitly out of scope until a later day's scope adds them — this
-skill must not be used to justify adding either early.
+skill must not be used to justify adding either early. Cryptographic
+build provenance/attestation/signing is likewise deferred past Day 4 —
+see `docs/build-security.md`.

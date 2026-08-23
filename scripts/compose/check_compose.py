@@ -39,9 +39,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 EXPECTED_SERVICES = {"app", "gateway", "state"}
-EXPECTED_APP_HEALTHCHECK = ["CMD", "python3", "-m", "app.healthcheck"]
-EXPECTED_GATEWAY_HEALTHCHECK = ["CMD", "python3", "-m", "gateway.healthcheck"]
-EXPECTED_STATE_HEALTHCHECK = ["CMD", "python3", "-m", "state.healthcheck"]
+# Absolute interpreter path (Day 4): the release image's final runtime is
+# Distroless (no shell, so no PATH resolution for a bare "python3" name).
+PYTHON_BIN = "/usr/bin/python3.13"
+EXPECTED_APP_HEALTHCHECK = ["CMD", PYTHON_BIN, "-m", "app.healthcheck"]
+EXPECTED_GATEWAY_HEALTHCHECK = ["CMD", PYTHON_BIN, "-m", "gateway.healthcheck"]
+EXPECTED_STATE_HEALTHCHECK = ["CMD", PYTHON_BIN, "-m", "state.healthcheck"]
 
 EXPECTED_EDGE_MEMBERS = {"gateway", "app"}
 EXPECTED_BACKEND_MEMBERS = {"app", "state"}

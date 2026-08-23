@@ -5,29 +5,52 @@ PYTHON ?= python3
 VERSION := $(shell cat VERSION)
 IMAGE := maops-docker-platform:$(VERSION)
 
+# Deterministic-build strategy (Day 4, see docs/build-security.md):
+# SOURCE_DATE_EPOCH is the current commit's own timestamp - fixed per
+# commit, never the current wall clock - used only to normalize otherwise
+# real-time-varying file/layer timestamps via BuildKit's
+# `rewrite-timestamp=true` exporter option. Falls back to a fixed
+# sentinel (0) outside a git repository, never to `date +%s`.
+SOURCE_DATE_EPOCH := $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
+BUILD_TAR := .cache/build/maops-docker-platform-$(VERSION).tar
+
 # Exported so every `docker compose` invocation (directly, or via the
 # Python scripts below through subprocess, which inherit the parent
 # environment) resolves compose.yaml's ${VERSION:-...} interpolation to
 # the real, current VERSION rather than its fallback default.
 export VERSION
 
-.PHONY: help test lint dockerfile-check compose-check build inspect smoke security-check compose-test quality release-check clean
+.PHONY: help test lint dockerfile-check compose-check quality \
+	build inspect image-audit smoke security-check compose-test \
+	reproducibility-check sbom sbom-check vuln-scan supply-chain-check \
+	release-check clean
 
 help:
 	@echo "Available targets:"
-	@echo "  help            Show this help message"
-	@echo "  test            Run the unittest suite"
-	@echo "  lint            Run the project-specific source validator (app/, gateway/)"
-	@echo "  dockerfile-check  Run the project-specific Dockerfile validator"
-	@echo "  compose-check   Run the project-specific Compose structural validator"
-	@echo "  build           Build the Docker image, tagged $(IMAGE)"
-	@echo "  inspect         Print image inspect/ls/history for $(IMAGE)"
-	@echo "  smoke           Run the real-image container smoke test"
-	@echo "  security-check  Run the hardened-runtime security verification"
-	@echo "  compose-test    Run the real Compose stack integration test"
-	@echo "  quality         test + lint + dockerfile-check + compose-check"
-	@echo "  release-check   quality + build + inspect + smoke + security-check + compose-test"
-	@echo "  clean           Remove known project-owned generated resources"
+	@echo "  help                 Show this help message"
+	@echo "  test                 Run the unittest suite"
+	@echo "  lint                 Run the project-specific source validator (app/, gateway/, state/)"
+	@echo "  dockerfile-check     Run the project-specific Dockerfile validator"
+	@echo "  compose-check        Run the project-specific Compose structural validator"
+	@echo "  quality              test + lint + dockerfile-check + compose-check"
+	@echo ""
+	@echo "  build                Deterministic BuildKit build (slim builder -> Distroless runtime), tagged $(IMAGE)"
+	@echo "  inspect              Print image inspect/ls/history for $(IMAGE)"
+	@echo "  image-audit          Project-specific release-image policy audit (incl. Distroless shell/pip absence)"
+	@echo "  smoke                Real-image container smoke test (single-role + multi-role chain)"
+	@echo "  security-check       Hardened-runtime security verification"
+	@echo "  compose-test         Real Compose stack integration test"
+	@echo "  reproducibility-check  Independent two-build image-identity reproducibility proof"
+	@echo ""
+	@echo "  sbom                 Generate SPDX JSON SBOM for $(IMAGE) via pinned Syft"
+	@echo "  sbom-check           Validate the generated SBOM"
+	@echo "  vuln-scan            Generate a Trivy JSON report + enforce vulnerability policy"
+	@echo "  supply-chain-check   sbom + sbom-check + vuln-scan"
+	@echo ""
+	@echo "  release-check        quality + build + inspect + image-audit + smoke +"
+	@echo "                       security-check + compose-test + reproducibility-check +"
+	@echo "                       sbom + sbom-check + vuln-scan"
+	@echo "  clean                Remove known project-owned generated resources"
 	@echo ""
 	@echo "Image tag is derived from VERSION: $(IMAGE)"
 
@@ -43,8 +66,17 @@ dockerfile-check:
 compose-check:
 	$(PYTHON) scripts/compose/check_compose.py
 
+quality: test lint dockerfile-check compose-check
+
 build:
-	docker build --no-cache -f docker/app/Dockerfile --build-arg VERSION=$(VERSION) -t $(IMAGE) .
+	@mkdir -p $(dir $(BUILD_TAR))
+	docker buildx build --no-cache \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
+		--output type=docker,rewrite-timestamp=true,name=$(IMAGE),dest=$(BUILD_TAR) \
+		-f docker/app/Dockerfile .
+	docker load -i $(BUILD_TAR)
+	rm -f $(BUILD_TAR)
 
 inspect:
 	@echo "=== docker image inspect $(IMAGE) ==="
@@ -53,6 +85,9 @@ inspect:
 	docker image ls $(IMAGE)
 	@echo "=== docker history $(IMAGE) ==="
 	docker history $(IMAGE)
+
+image-audit:
+	$(PYTHON) scripts/build/image_audit.py
 
 smoke:
 	$(PYTHON) scripts/smoke/container_smoke.py
@@ -63,18 +98,40 @@ security-check:
 compose-test:
 	$(PYTHON) scripts/compose/compose_integration.py
 
-quality: test lint dockerfile-check compose-check
+reproducibility-check:
+	$(PYTHON) scripts/build/reproducibility_check.py
 
-release-check: quality build inspect smoke security-check compose-test
+sbom:
+	$(PYTHON) scripts/security/generate_sbom.py
+
+sbom-check:
+	$(PYTHON) scripts/security/check_sbom.py
+
+vuln-scan:
+	$(PYTHON) scripts/security/vuln_scan.py
+
+supply-chain-check: sbom sbom-check vuln-scan
+	@echo "supply-chain-check: sbom + sbom-check + vuln-scan all passed"
+
+release-check: quality build inspect image-audit smoke security-check compose-test reproducibility-check sbom sbom-check vuln-scan
 	@echo "=== docker compose config ==="
 	docker compose config
 
 clean:
 	find . -type d -name '__pycache__' -not -path './.git/*' -exec rm -rf {} +
 	rm -rf .pytest_cache .mypy_cache .ruff_cache
-	@echo "removing any leftover maops-smoke-*/maops-security-* containers (self-cleaning scripts should leave none)"
-	@ids="$$(docker ps -aq --filter 'name=^maops-smoke-' --filter 'name=^maops-security-')"; \
+	rm -rf .cache
+	@echo "removing any leftover maops-smoke-*/maops-security-*/maops-image-audit-* containers (self-cleaning scripts should leave none)"
+	@ids="$$(docker ps -aq --filter 'name=^maops-smoke-' --filter 'name=^maops-security-' --filter 'name=^maops-image-audit-')"; \
 	if [ -n "$$ids" ]; then docker rm -f $$ids; else echo "none found"; fi
+	@echo "removing any leftover maops-smoke-net-* throwaway networks (multi-role smoke's own teardown should leave none)"
+	@nets="$$(docker network ls --filter 'name=^maops-smoke-net-' --format '{{.Name}}')"; \
+	if [ -n "$$nets" ]; then echo "$$nets" | xargs -r -n1 docker network rm; else echo "none found"; fi
+	@echo "removing any leftover maops-repro-* reproducibility-check images/containers (its own teardown should leave none)"
+	@rids="$$(docker ps -aq --filter 'name=^maops-repro-')"; \
+	if [ -n "$$rids" ]; then docker rm -f $$rids; else echo "none found"; fi
+	@rimgs="$$(docker images --filter 'reference=maops-repro-*' --format '{{.Repository}}:{{.Tag}}')"; \
+	if [ -n "$$rimgs" ]; then echo "$$rimgs" | xargs -r -n1 docker rmi -f; else echo "none found"; fi
 	@echo "removing any leftover maops-compose-* Compose project resources, including their own named volume (compose_integration.py's own teardown should leave none)"
 	@projects="$$(docker ps -a --filter 'name=^maops-compose-' --format '{{.Names}}' | sed -E 's/^(maops-compose-[a-f0-9]+)-(app|gateway|state)-1$$/\1/' | sort -u)"; \
 	if [ -n "$$projects" ]; then \

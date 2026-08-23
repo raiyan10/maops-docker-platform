@@ -16,6 +16,50 @@ application is intentionally tiny — a few JSON endpoints — so that
 essentially all of the engineering effort and all of the review surface
 is the container layer, not application logic.
 
+## Day 4 additions (build/image security and reproducibility)
+
+- **Distroless runtime**: the release image's final stage is
+  `gcr.io/distroless/python3-debian13:nonroot` — no shell, no package
+  manager, no `pip`/`setuptools`. The originally planned
+  `python:3.13-slim` runtime was rejected (4 unfixed CRITICAL `perl-base`
+  findings); Distroless was adopted after real vulnerability scanning,
+  runtime testing, and reproducibility re-verification all passed against
+  it. See [docs/build-security.md](docs/build-security.md).
+- **Two-stage build**: a digest-pinned `python:3.13-slim` builder stage
+  (filesystem preparation only) feeding the digest-pinned Distroless
+  final stage — the builder's own toolchain never enters the release
+  image.
+- A deterministic BuildKit/buildx release build (`make build`) — two
+  independent, clean builds from the identical source tree produce a
+  **byte-identical image ID**, proven by `make reproducibility-check`
+  (re-verified after the Distroless migration).
+- Application source is root-owned in the image (image-level
+  immutability), independent of and in addition to `compose.yaml`'s
+  runtime `read_only: true` — proven with a real write attempt against a
+  container started with *no* hardening flags at all.
+- A project-specific release-image policy audit (`make image-audit`),
+  now including Distroless-specific proofs: shell absence, package-
+  manager absence, pip/setuptools absence, and the expected
+  `/usr/bin/python3.13` interpreter.
+- Real SBOM generation (Syft, SPDX JSON — `make sbom`/`sbom-check`) and
+  real vulnerability scanning (Trivy, JSON, with an explicit
+  Critical/fixable-High policy — `make vuln-scan`) for the exact release
+  image; both scanners pinned by exact digest, neither ever given the
+  Docker socket. See [docs/build-security.md](docs/build-security.md) and
+  [docs/supply-chain.md](docs/supply-chain.md) — the Distroless-based
+  release image's vulnerability policy genuinely **passes** (Critical=0,
+  fixable High=0), reported alongside the 15 unfixed-High findings that
+  remain (non-blocking under policy).
+- A multi-role chain smoke test (`state`+`app`+`gateway` from one image,
+  without Compose) — every in-container probe across this project's
+  tooling now execs the absolute `/usr/bin/python3.13` interpreter, never
+  a shell, matching the Distroless runtime's own constraints.
+- Closed six Day 3 review findings (`schema_version` boolean-bypass,
+  role-aware read-only-write verification, a real `docker network
+  inspect` proof, a stale doc reference, `SIGTERM` handling in the
+  Compose integration harness, and a documentation clarification for
+  cross-hop timeout stacking).
+
 ## Day 1 + Day 2 + Day 3 functionality
 
 - `app`: `GET /`, `/healthz`, `/readyz`, `/info`, `GET /state`, `POST
@@ -48,10 +92,11 @@ is the container layer, not application logic.
   configuration outside the image — see
   [docs/configuration.md](docs/configuration.md).
 - A digest-pinned, non-root (`10001:10001`) Dockerfile building one image
-  that runs any of three roles (`python3 -m app`, `-m gateway`, or `-m
-  state`) directly as PID 1 in exec form, with a per-role stdlib-only
-  `HEALTHCHECK`, and `/data` pre-created with correct non-root ownership
-  so the `state_data` named volume works without running as root.
+  that runs any of three roles (`/usr/bin/python3.13 -m app`, `-m
+  gateway`, or `-m state`) directly as PID 1 in exec form, with a
+  per-role stdlib-only `HEALTHCHECK`, and `/data` pre-created with
+  correct non-root ownership so the `state_data` named volume works
+  without running as root.
 - A three-service `compose.yaml` (`state` -> `app` -> `gateway`,
   health-gated in that order) — `app`/`state` not host-published,
   `gateway` the sole host-published service on `127.0.0.1` — all three
@@ -91,12 +136,21 @@ make dockerfile-check    # project-specific Dockerfile validator
 make compose-check         # project-specific Compose structural validator
 make quality                 # test + lint + dockerfile-check + compose-check
 
-make build                     # docker build, tagged maops-docker-platform:<VERSION>
+make build                     # deterministic BuildKit build, tagged maops-docker-platform:<VERSION>
 make inspect                     # docker image inspect / ls / history
-make smoke                         # real-image container smoke test (app role)
-make security-check                  # hardened-runtime security verification
-make compose-test                      # real Compose-stack integration test
-make release-check                       # quality + build + inspect + smoke + security-check + compose-test
+make image-audit                   # project-specific release-image policy audit
+make smoke                           # real-image container smoke test (single-role + multi-role chain)
+make security-check                    # hardened-runtime security verification
+make compose-test                        # real Compose-stack integration test
+make reproducibility-check                 # independent two-build image-identity proof
+
+make sbom                                    # generate SPDX JSON SBOM (Syft)
+make sbom-check                                # validate the generated SBOM
+make vuln-scan                                   # generate Trivy JSON + enforce vulnerability policy
+make supply-chain-check                            # sbom + sbom-check + vuln-scan
+
+make release-check   # quality + build + inspect + image-audit + smoke + security-check +
+                      #   compose-test + reproducibility-check + sbom + sbom-check + vuln-scan
 
 docker compose up -d                       # run the stack locally (state -> app -> gateway)
 curl http://localhost:8080/readyz            # via the gateway (loopback-only;
@@ -121,8 +175,11 @@ image content leakage, secrets, healthcheck),
 [docs/architecture.md](docs/architecture.md) for the application/
 container boundary and PID 1 process model,
 [docs/networking.md](docs/networking.md) for the network segmentation
-proofs, and [docs/persistence.md](docs/persistence.md) for the volume/
-read-only-rootfs interaction.
+proofs, [docs/persistence.md](docs/persistence.md) for the volume/
+read-only-rootfs interaction, [docs/build-security.md](docs/build-security.md)
+for deterministic builds and image-level immutability, and
+[docs/supply-chain.md](docs/supply-chain.md) for SBOM generation,
+vulnerability scanning, and this project's explicit vulnerability policy.
 
 ## Repository structure
 
@@ -131,22 +188,27 @@ app/                     # stdlib-only Python HTTP workload (Day 1 backend)
 gateway/                 # stdlib-only Python gateway (Day 2, sole host-facing service)
 state/                   # stdlib-only Python persistence service (Day 3)
 config/platform.json     # non-secret, Compose-mounted runtime configuration (Day 3)
-docker/app/Dockerfile    # hardened, non-root, digest-pinned image, all three roles
+security/scanners.lock   # digest-pinned Syft/Trivy scanner references (Day 4)
+docker/app/Dockerfile    # two-stage: slim builder -> Distroless final runtime, non-root, all three roles
 compose.yaml             # three-service hardened Compose stack (state -> app -> gateway)
-tests/                   # unittest suite (app/ + gateway/ + state/)
+tests/                   # unittest suite (app/ + gateway/ + state/ + Day 4 tooling)
 scripts/lint/            # project-specific source + Dockerfile validators
 scripts/compose/         # project-specific Compose structural + integration checks
-scripts/smoke/           # real-image container smoke test
+scripts/smoke/           # real-image container smoke test (single-role + multi-role)
 scripts/verify/          # runtime security verification
+scripts/build/           # deterministic-build reproducibility proof + image policy audit (Day 4)
+scripts/security/        # SBOM generation/validation + vulnerability scan/policy (Day 4)
+artifacts/               # generated SBOM/vulnerability-report output (git-ignored)
 docs/                    # architecture, security, networking, configuration,
-                         #   persistence, compose platform, roadmap
+                         #   persistence, compose platform, build security,
+                         #   supply chain, roadmap
 .claude/                 # project agents, skills, and guidance
 VERSION                  # single authoritative version source
 ```
 
 ## Current version
 
-`0.3.0` (see `VERSION`) — Day 3 of 7.
+`0.4.0` (see `VERSION`) — Day 4 of 7.
 
 ## Seven-day roadmap (high level)
 
@@ -154,8 +216,8 @@ VERSION                  # single authoritative version source
 |---|---|
 | 1 | Secure container foundation |
 | 2 | Compose multi-service topology |
-| 3 | Networking, configuration, volumes, persistence *(this release)* |
-| 4 | Build/image security and reproducibility |
+| 3 | Networking, configuration, volumes, persistence |
+| 4 | Build/image security and reproducibility *(this release)* |
 | 5 | Health, reliability, resources, observability |
 | 6 | CI/CD, integration, release engineering |
 | 7 | Hardening, reviews, showcase -> v1.0.0 |

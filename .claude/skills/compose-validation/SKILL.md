@@ -52,32 +52,39 @@ extending coverage, or cross-verifying the automated scripts' own claims.
    distinction `container-security-validation` uses, and
    `compose_integration.py` automates it by directly reusing
    `security_check.py`'s own check functions rather than a separate
-   implementation:
+   implementation. **Day 4: the release image's final runtime is
+   Distroless (no shell, no `id`/`cat`) — every probe execs the absolute
+   `/usr/bin/python3.13` interpreter directly:**
    ```bash
    for c in maops-compose-manual-state-1 maops-compose-manual-app-1 maops-compose-manual-gateway-1; do
      docker inspect "$c" --format \
        'ReadonlyRootfs={{.HostConfig.ReadonlyRootfs}} CapDrop={{.HostConfig.CapDrop}} SecurityOpt={{.HostConfig.SecurityOpt}}'
-     docker exec "$c" id
-     docker exec "$c" cat /proc/1/cmdline
-     docker exec "$c" sh -c 'echo x > /etc/maops-manual-probe' # must fail: read-only
+     docker exec "$c" /usr/bin/python3.13 -c "import os; print(os.getuid(), os.getgid())"
+     docker exec "$c" /usr/bin/python3.13 -c "from pathlib import Path; print(Path('/proc/1/cmdline').read_text())"
+     docker exec "$c" /usr/bin/python3.13 -c "open('/etc/maops-manual-probe', 'w').write('x')" # must fail: read-only
    done
-   docker exec maops-compose-manual-state-1 sh -c 'echo x > /data/manual-probe && rm /data/manual-probe' # must succeed
+   docker exec maops-compose-manual-state-1 /usr/bin/python3.13 -c "
+   import os
+   open('/data/manual-probe', 'w').write('x')
+   os.remove('/data/manual-probe')
+   "  # must succeed
    ```
 
 5. **Network membership and isolation** — confirm real DNS resolution
    succeeds along the intended path and fails across the isolation
    boundary:
    ```bash
-   docker exec maops-compose-manual-gateway-1 python3 -c "import socket; socket.gethostbyname('app')"     # succeeds
-   docker exec maops-compose-manual-app-1 python3 -c "import socket; socket.gethostbyname('state')"       # succeeds
-   docker exec maops-compose-manual-gateway-1 python3 -c "import socket; socket.gethostbyname('state')"   # must fail
-   docker exec maops-compose-manual-state-1 python3 -c "import socket; socket.gethostbyname('gateway')"   # must fail
+   docker exec maops-compose-manual-gateway-1 /usr/bin/python3.13 -c "import socket; socket.gethostbyname('app')"     # succeeds
+   docker exec maops-compose-manual-app-1 /usr/bin/python3.13 -c "import socket; socket.gethostbyname('state')"       # succeeds
+   docker exec maops-compose-manual-gateway-1 /usr/bin/python3.13 -c "import socket; socket.gethostbyname('state')"   # must fail
+   docker exec maops-compose-manual-state-1 /usr/bin/python3.13 -c "import socket; socket.gethostbyname('gateway')"   # must fail
    ```
 
 6. **Functional check through the gateway** — `app`/`state` have no
    published port, so every check goes through `gateway`'s loopback port;
    find it first, then actually call the service, don't just trust health
-   status:
+   status (this uses the host's own `python3`, not the container's —
+   `http.client` runs on the host against the mapped loopback port):
    ```bash
    docker port maops-compose-manual-gateway-1 8080/tcp
    python3 -c "
@@ -122,6 +129,26 @@ extending coverage, or cross-verifying the automated scripts' own claims.
    ```
    All three filtered listings must be empty afterward — no leftover
    container, network, or volume.
+
+## Day 4 additions to steps 4 and 5
+
+- Step 4's rootfs-write-rejection reuse of `security_check.py` is now
+  **role-aware**: `compose_integration.py` calls
+  `check_kernel_readonly_write_fails(container, port, role=name)`, so the
+  "service kept serving" half genuinely probes that container's own
+  `state.healthcheck`/`app.healthcheck`/`gateway.healthcheck` module, not
+  a hardcoded `app.healthcheck` regardless of role (closes Day 3 finding
+  A-2).
+- A real, live `docker network inspect` proof for step 5's network-
+  isolation claim: `backend`'s `Internal` field is `true` and `edge`'s is
+  `false`, checked against the actual running network object
+  (`docker network inspect <project>_backend --format '{{json .Internal}}'`),
+  not merely the rendered `compose.yaml` config `check_compose.py`
+  already checks (closes Day 3 finding A-3).
+  ```bash
+  docker network inspect maops-compose-manual_backend --format '{{json .Internal}}'  # true
+  docker network inspect maops-compose-manual_edge --format '{{json .Internal}}'     # false
+  ```
 
 ## Extending across Days 4-7
 

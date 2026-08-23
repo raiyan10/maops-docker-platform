@@ -27,6 +27,16 @@ running container and asserts a clean, fast exit - prior to this, every
 script here only ever force-removed containers (`docker rm -f`), so a
 broken SIGTERM handler would have produced zero automated failures
 anywhere.
+
+Day 4: the release image's final runtime is Distroless
+(`gcr.io/distroless/python3-debian13:nonroot`), which has no shell and no
+coreutils (`sh`, `cat`, `id`, `find`, ... are all absent by design - see
+docs/build-security.md). Every `docker exec` probe below that used to
+shell out to a coreutils binary (`cat /proc/1/status`, `id -u`/`id -g`,
+`sh -c 'echo ... > path'`) now instead execs
+`/usr/bin/python3.13 -c '<stdlib-only probe>'` directly - no shell
+involved, matching the same [D] kernel/process evidence tier as before
+via a different (shell-free) mechanism, never a weaker one.
 """
 
 from __future__ import annotations
@@ -55,6 +65,37 @@ CAT_SOURCE = "A:source/config"
 CAT_IMAGE = "B:image-inspection"
 CAT_RUNTIME = "C:docker-runtime"
 CAT_KERNEL = "D:kernel/process"
+
+# Absolute interpreter path (Day 4): the Distroless final runtime has no
+# shell to perform PATH resolution, so every in-container probe execs
+# this directly rather than a bare "python3"/"python3.13" name.
+PYTHON_BIN = "/usr/bin/python3.13"
+
+
+def _write_rejected_probe_source(path: str) -> str:
+    """Stdlib-only probe source: attempts a real write to `path`. Exit code
+    mirrors normal Unix write-command convention (0 = write succeeded,
+    nonzero = write failed/rejected) so call sites can keep testing
+    `returncode != 0` exactly as they did against the prior `sh -c 'echo
+    ... > path'` mechanism (which the shellless Distroless runtime cannot
+    run) - only the mechanism changed, not the exit-code contract."""
+    return (
+        "import os, sys\n"
+        f"path = {path!r}\n"
+        "try:\n"
+        "    with open(path, 'w') as f:\n"
+        "        f.write('probe')\n"
+        "except OSError as exc:\n"
+        "    print(f'write rejected: {exc}')\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    try:\n"
+        "        os.remove(path)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    print('write UNEXPECTEDLY SUCCEEDED')\n"
+        "    sys.exit(0)\n"
+    )
 
 
 class CheckResult:
@@ -312,10 +353,14 @@ def check_runtime_healthy(container_name: str) -> CheckResult:
 # --- [D] kernel/process verification ------------------------------------
 
 
+_CAT_PROC_1_STATUS_SOURCE = "from pathlib import Path; print(Path('/proc/1/status').read_text(), end='')"
+_UID_GID_SOURCE = "import os; print(os.getuid()); print(os.getgid())"
+
+
 def read_proc_1_status(container_name: str) -> dict[str, str]:
-    result = run_docker(["exec", container_name, "cat", "/proc/1/status"])
+    result = run_docker(["exec", container_name, PYTHON_BIN, "-c", _CAT_PROC_1_STATUS_SOURCE])
     if result.returncode != 0:
-        raise RuntimeError(f"docker exec cat /proc/1/status failed: {result.stderr.strip()}")
+        raise RuntimeError(f"docker exec (read /proc/1/status) failed: {result.stderr.strip()}")
     fields: dict[str, str] = {}
     for line in result.stdout.splitlines():
         if ":" in line:
@@ -325,10 +370,10 @@ def read_proc_1_status(container_name: str) -> dict[str, str]:
 
 
 def check_kernel_effective_uid_gid(container_name: str) -> CheckResult:
-    uid_result = run_docker(["exec", container_name, "id", "-u"])
-    gid_result = run_docker(["exec", container_name, "id", "-g"])
-    uid = uid_result.stdout.strip()
-    gid = gid_result.stdout.strip()
+    result = run_docker(["exec", container_name, PYTHON_BIN, "-c", _UID_GID_SOURCE])
+    lines = result.stdout.splitlines()
+    uid = lines[0].strip() if len(lines) > 0 else "?"
+    gid = lines[1].strip() if len(lines) > 1 else "?"
     passed = uid == "10001" and gid == "10001"
     return CheckResult(CAT_KERNEL, "effective process UID:GID is 10001:10001", passed, f"uid={uid} gid={gid}")
 
@@ -354,37 +399,79 @@ def check_kernel_no_new_privs(container_name: str) -> CheckResult:
     return CheckResult(CAT_KERNEL, "kernel NoNewPrivs flag is set", value == "1", f"NoNewPrivs={value}")
 
 
-def check_kernel_readonly_write_fails(container_name: str, port: int) -> CheckResult:
+ROLE_HEALTHCHECK_MODULES = {
+    "app": "app.healthcheck",
+    "gateway": "gateway.healthcheck",
+    "state": "state.healthcheck",
+}
+
+
+def healthcheck_module_for_role(role: str) -> str:
+    """Map a service role name to its own healthcheck probe module.
+
+    Closes Day 3 finding A-2 (day-03-security-review.md M-1 /
+    day-03-test-review.md): the "service kept serving" half of
+    check_kernel_readonly_write_fails() used to unconditionally probe
+    app.healthcheck regardless of which role's container it was actually
+    checking. This mapping is the single source of truth for the
+    dispatch-by-role behavior, and is deliberately a pure function (no
+    Docker call) so it has its own direct, Docker-free unit test.
+    """
+    try:
+        return ROLE_HEALTHCHECK_MODULES[role]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown role {role!r}, expected one of {sorted(ROLE_HEALTHCHECK_MODULES)}"
+        ) from exc
+
+
+def check_kernel_readonly_write_fails(container_name: str, port: int, role: str = "app") -> CheckResult:
+    """Attempt a real prohibited rootfs write, then prove *that role's own*
+    service is still serving - not merely that some service somewhere is.
+
+    `role` selects the healthcheck module via healthcheck_module_for_role()
+    (`app`/`gateway`/`state`), so a `state`- or `gateway`-role container is
+    genuinely probed with its own `/healthz`, not app's.
+    """
     probe_path = "/etc/maops-readonly-probe"
     write_result = run_docker(
-        ["exec", container_name, "sh", "-c", f"echo probe > {probe_path}"]
+        ["exec", container_name, PYTHON_BIN, "-c", _write_rejected_probe_source(probe_path)]
     )
     write_rejected = write_result.returncode != 0
+
+    healthcheck_module = healthcheck_module_for_role(role)
 
     # The service must keep functioning after the rejected write attempt.
     still_serving = False
     try:
-        conn_check = run_docker(["exec", container_name, "python3", "-m", "app.healthcheck"])
+        conn_check = run_docker(["exec", container_name, PYTHON_BIN, "-m", healthcheck_module])
         still_serving = conn_check.returncode == 0
     except Exception:
         still_serving = False
 
     passed = write_rejected and still_serving
     detail = (
-        f"write exit={write_result.returncode} stderr={write_result.stderr.strip()!r} "
-        f"service_still_healthy={still_serving}"
+        f"write exit={write_result.returncode} stdout={write_result.stdout.strip()!r} "
+        f"service_still_healthy={still_serving} (probed via {PYTHON_BIN} -m {healthcheck_module})"
     )
-    return CheckResult(CAT_KERNEL, "attempted write to read-only rootfs fails, service keeps serving", passed, detail)
+    return CheckResult(
+        CAT_KERNEL, f"attempted write to read-only rootfs fails, {role} service keeps serving", passed, detail
+    )
+
+
+_CAT_PROC_1_CMDLINE_SOURCE = "from pathlib import Path; print(Path('/proc/1/cmdline').read_text(), end='')"
 
 
 def check_kernel_pid1_identity(container_name: str) -> CheckResult:
-    result = run_docker(["exec", container_name, "cat", "/proc/1/cmdline"])
+    result = run_docker(["exec", container_name, PYTHON_BIN, "-c", _CAT_PROC_1_CMDLINE_SOURCE])
+    expected = [PYTHON_BIN, "-m", "app"]
     if result.returncode != 0:
-        return CheckResult(CAT_KERNEL, "PID 1 process identity is python3 -m app", False, result.stderr.strip())
+        return CheckResult(
+            CAT_KERNEL, f"PID 1 process identity is {' '.join(expected)}", False, result.stderr.strip()
+        )
     cmdline = [part for part in result.stdout.split("\x00") if part]
-    expected = ["python3", "-m", "app"]
     return CheckResult(
-        CAT_KERNEL, "PID 1 process identity is python3 -m app", cmdline == expected, repr(cmdline)
+        CAT_KERNEL, f"PID 1 process identity is {' '.join(expected)}", cmdline == expected, repr(cmdline)
     )
 
 
@@ -461,7 +548,7 @@ def get_host_port(container_name: str) -> int:
 def wait_until_running(container_name: str, deadline_seconds: float) -> None:
     deadline = time.monotonic() + deadline_seconds
     while time.monotonic() < deadline:
-        result = run_docker(["exec", container_name, "python3", "-m", "app.healthcheck"])
+        result = run_docker(["exec", container_name, PYTHON_BIN, "-m", "app.healthcheck"])
         if result.returncode == 0:
             return
         time.sleep(POLL_INTERVAL_SECONDS)
