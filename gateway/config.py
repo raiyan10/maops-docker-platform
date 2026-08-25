@@ -33,12 +33,18 @@ DEFAULT_NAME = "maops-docker-platform-gateway"
 MIN_PORT = 1
 MAX_PORT = 65535
 
-# The actual default lives in platform_config.DEFAULT_DEPENDENCY_TIMEOUT_SECONDS
-# (used when no mounted platform config overrides it) - bounded so the
-# gateway can never hang indefinitely waiting on the backend.
-# http.client.HTTPConnection applies a single socket-level timeout to both
-# the connect and the subsequent read/recv, so one value covers the whole
-# request. See GatewayConfig.upstream_timeout_seconds.
+# The actual default lives in
+# platform_config.DEFAULT_GATEWAY_UPSTREAM_TIMEOUT_SECONDS (used when no
+# mounted platform config overrides it) - bounded so the gateway can never
+# hang indefinitely waiting on the backend, and - as of Day 5 - guaranteed
+# by platform_config.py's own load-time invariant check to exceed app's own
+# inner state_dependency_timeout_seconds by at least
+# timeout_safety_margin_seconds (closes Day 3 finding A-6, cross-hop
+# timeout stacking - see platform_config.py's module docstring and
+# docs/reliability.md). http.client.HTTPConnection applies a single
+# socket-level timeout to both the connect and the subsequent read/recv, so
+# one value covers the whole request. See
+# GatewayConfig.upstream_timeout_seconds.
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,6 @@ def load_config(
         port=port,
         upstream_host=upstream_host,
         upstream_port=upstream_port,
-        upstream_timeout_seconds=platform_cfg.dependency_timeout_seconds,
+        upstream_timeout_seconds=platform_cfg.gateway_upstream_timeout_seconds,
         name=DEFAULT_NAME,
     )

@@ -68,7 +68,7 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual(config.name, DEFAULT_NAME)
         self.assertEqual(config.state_host, DEFAULT_STATE_HOST)
         self.assertEqual(config.state_port, DEFAULT_STATE_PORT)
-        self.assertEqual(config.state_timeout_seconds, 3.0)
+        self.assertEqual(config.state_timeout_seconds, 2.0)
 
     def test_app_host_override(self) -> None:
         config = load_config(env={"APP_HOST": "127.0.0.1"}, platform_config_path=NO_PLATFORM_CONFIG)
@@ -128,7 +128,7 @@ class LoadConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "platform.json"
             config_path.write_text(
-                '{"schema_version": 1, "dependency_timeout_seconds": 1.5}', encoding="utf-8"
+                '{"schema_version": 1, "state_dependency_timeout_seconds": 1.5}', encoding="utf-8"
             )
             config = load_config(env={}, platform_config_path=config_path)
             self.assertEqual(config.state_timeout_seconds, 1.5)
@@ -137,7 +137,7 @@ class LoadConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "platform.json"
             config_path.write_text(
-                '{"schema_version": 1, "dependency_timeout_seconds": -1}', encoding="utf-8"
+                '{"schema_version": 1, "state_dependency_timeout_seconds": -1}', encoding="utf-8"
             )
             with self.assertRaises(ValueError):
                 load_config(env={}, platform_config_path=config_path)

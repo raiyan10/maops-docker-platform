@@ -1,4 +1,4 @@
-# Configuration (Day 3)
+# Configuration (Day 3, timeout fields updated Day 5)
 
 ## Four distinct mechanisms - do not conflate them
 
@@ -37,7 +37,9 @@ mis-scoped security review, so they are listed explicitly:
 {
   "schema_version": 1,
   "platform_name": "maops-docker-platform",
-  "dependency_timeout_seconds": 3.0,
+  "state_dependency_timeout_seconds": 2.0,
+  "gateway_upstream_timeout_seconds": 5.0,
+  "timeout_safety_margin_seconds": 1.0,
   "state_filename": "state.json"
 }
 ```
@@ -49,8 +51,18 @@ validates and uses only the subset of fields it actually needs:
 |---|---|---|
 | `schema_version` | all three | must be exactly `1`; anything else fails loading |
 | `platform_name` | app, gateway (metadata only) | validated present/non-empty, not currently surfaced in any response |
-| `dependency_timeout_seconds` | app, gateway | bounds the outbound call to their fixed dependency (`state`, `app` respectively) - replaces the Day 2 hardcoded `UPSTREAM_TIMEOUT_SECONDS` constant |
+| `state_dependency_timeout_seconds` | app (operationally); gateway (invariant check only) | bounds `app`'s own call to `state` - the *inner* hop of the Day 5 timeout hierarchy |
+| `gateway_upstream_timeout_seconds` | gateway | bounds `gateway`'s own call to `app` - the *outer* hop |
+| `timeout_safety_margin_seconds` | gateway (invariant check only) | minimum required headroom between the two hops |
 | `state_filename` | state | the bare filename (never a path) of the persisted counter file under the fixed `/data` mount |
+
+Day 5 replaced the single Day 3/4 `dependency_timeout_seconds` field
+(applied identically, and independently, at both hops) with this explicit
+two-hop budget - see `docs/reliability.md` for the full rationale (it
+closes Day 3 finding A-6, cross-hop timeout stacking) and the required
+`gateway_upstream_timeout_seconds > state_dependency_timeout_seconds +
+timeout_safety_margin_seconds` invariant, enforced by
+`gateway/platform_config.py` at load time.
 
 ## Parsing rules (stdlib only, fail clearly)
 
@@ -60,15 +72,21 @@ existing per-package convention):
 
 - If the file is absent, sensible defaults are used silently - this
   supports a bare `docker run` outside Compose and every unit test, none
-  of which mount anything.
+  of which mount anything. The shipped defaults (2.0s inner, 5.0s outer,
+  1.0s margin) already satisfy the Day 5 timeout-hierarchy invariant.
 - If the file is present but fails to parse as JSON, is not a JSON
   object, has the wrong `schema_version`, or has a field of the wrong
   type/out of range, loading raises `ValueError` and the process fails to
   start - a mounted, intentionally-provided config that doesn't validate
   is a real operator error, not something to paper over silently.
-- `dependency_timeout_seconds` must be a real number (not `bool`, which
-  is a `int` subclass in Python and is explicitly rejected) in
-  `(0, 30]` seconds.
+- `state_dependency_timeout_seconds`, `gateway_upstream_timeout_seconds`,
+  and `timeout_safety_margin_seconds` must each be a real, finite number
+  (not `bool`, which is an `int` subclass in Python and is explicitly
+  rejected; not `NaN`/`Infinity`/`-Infinity`, which Python's `json` module
+  otherwise accepts as a non-standard extension) in `(0, max]` seconds
+  (max is 30s for the inner hop and the margin, 60s for the outer hop) -
+  and, for `gateway`'s own load, the cross-field hierarchy invariant above
+  must also hold.
 - `state_filename` must be a bare filename matching `^[A-Za-z0-9._-]+$`,
   and never exactly `.` or `..` - this is joined onto the fixed `/data`
   directory with no further sanitization, so directory traversal is
@@ -81,8 +99,9 @@ existing per-package convention):
 ## Runtime-config-changes-without-rebuild, proven
 
 Because `config/platform.json` is a bind-mounted file, not baked into the
-image, changing `dependency_timeout_seconds` and recreating a container
-(no image rebuild) genuinely changes that container's observed timeout
+image, changing `state_dependency_timeout_seconds`/
+`gateway_upstream_timeout_seconds` and recreating a container (no image
+rebuild) genuinely changes that container's observed timeout
 behavior - `scripts/compose/compose_integration.py`'s `UpstreamTimeoutTests`-
 equivalent unit coverage (`tests/test_gateway_server.py::
 UpstreamTimeoutTests`, `tests/test_config.py`/`test_gateway_config.py`'s

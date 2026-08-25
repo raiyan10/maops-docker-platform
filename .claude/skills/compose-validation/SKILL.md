@@ -150,10 +150,75 @@ extending coverage, or cross-verifying the automated scripts' own claims.
   docker network inspect maops-compose-manual_edge --format '{{json .Internal}}'     # false
   ```
 
-## Extending across Days 4-7
+## Day 5 additions: resource limits, restart policy, stop_grace_period, timeout hierarchy
 
-When a later day adds a resource limit, restart policy, or CI-driven
-verification:
+`compose.yaml` now declares explicit CPU/memory/PID limits
+(`cpus: 0.50`, `mem_limit: 128m`, `pids_limit: 64`), a bounded restart
+policy (`restart: on-failure:3`), and `stop_grace_period: 10s` on all
+three services, and `config/platform.json` declares an explicit two-hop
+timeout budget (`state_dependency_timeout_seconds`,
+`gateway_upstream_timeout_seconds`, `timeout_safety_margin_seconds`) with
+a config-load-time invariant. `make compose-check` validates the
+structural/YAML side of all of this (`check_resource_limits`,
+`check_restart_policy`, `check_stop_grace_period`); `make
+reliability-check` (`scripts/reliability/reliability_check.py`) is the
+real-runtime counterpart and does not duplicate anything in this file's
+own step 2-9 procedure. Use the manual steps below when investigating a
+specific failure or cross-verifying `reliability_check.py`'s own claims —
+see `docs/reliability.md` for the full design:
+
+```bash
+# [C] resource limits and restart policy really applied to a real container
+docker inspect maops-compose-manual-state-1 --format \
+  'NanoCpus={{.HostConfig.NanoCpus}} Memory={{.HostConfig.Memory}} PidsLimit={{.HostConfig.PidsLimit}} RestartPolicy={{json .HostConfig.RestartPolicy}} StopTimeout={{.Config.StopTimeout}}'
+
+# [D] best-effort cgroup v2 corroboration (environment-dependent - see docs/reliability.md)
+docker exec maops-compose-manual-state-1 /usr/bin/python3.13 -c "
+for p in ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/pids.max', '/sys/fs/cgroup/cpu.max'):
+    try:
+        print(p, open(p).read().strip())
+    except OSError as exc:
+        print(p, 'unavailable:', exc)
+"
+
+# A-6 real adversarial proof: pause state, prove app/gateway stay locally
+# live while readiness degrades, and the request completes inside the
+# OUTER timeout budget - never a hang, never a raw traceback
+docker pause maops-compose-manual-state-1
+python3 -c "
+import time, http.client, json
+started = time.monotonic()
+conn = http.client.HTTPConnection('127.0.0.1', <gateway-host-port>, timeout=10)
+conn.request('GET', '/state')
+r = conn.getresponse()
+body = r.read()
+print(time.monotonic() - started, r.status, body)
+"
+docker exec maops-compose-manual-app-1 /usr/bin/python3.13 -m app.healthcheck   # exit 0 - still locally live
+docker unpause maops-compose-manual-state-1
+# poll gateway /readyz -> recovers to 200 automatically
+
+# unexpected crash: a real kernel-initiated OOM-kill (genuine SIGKILL) -
+# deliberately NOT `docker kill`/`docker stop`, which this project
+# empirically confirmed are treated as manual/intentional termination and
+# do NOT trigger the on-failure restart policy regardless of exit code
+# (see docs/reliability.md for the full experiment record)
+docker inspect maops-compose-manual-state-1 --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.RestartCount}}'
+docker update --memory 6m --memory-swap 6m maops-compose-manual-state-1
+# poll .RestartCount/.State.Running -> restarts automatically up to the
+# configured max (3), then correctly stops (State.OOMKilled == true)
+docker update --memory 128m --memory-swap -1 maops-compose-manual-state-1   # restore capacity
+docker compose -p maops-compose-manual start state                          # explicit operator recovery, only after the bound is proven
+
+# intentional stop: must NOT trigger the on-failure restart policy
+docker stop maops-compose-manual-state-1
+# poll .State.Running for a few seconds -> stays false; RestartCount unchanged
+docker compose -p maops-compose-manual start state
+```
+
+## Extending across Days 6-7
+
+When a later day adds CI-driven verification or registry publishing:
 
 - Add its own health/functional check to the relevant step above rather
   than only checking `state`/`app`/`gateway`.
@@ -162,8 +227,8 @@ verification:
   one volume/one config.
 - Never let further growth reintroduce `network_mode: host`, `pid: host`,
   a Docker socket mount, or an arbitrary host filesystem bind mount — the
-  Day 1-3 hardening baseline in `compose.yaml` must survive every later
-  day's growth, not just the first review.
+  Day 1-5 hardening/reliability baseline in `compose.yaml` must survive
+  every later day's growth, not just the first review.
 - Keep `app`/`state` non-host-published unless a later day's scope
   explicitly requires otherwise — `gateway` (or whatever becomes the edge
   service) should remain the only host-facing surface.

@@ -5,7 +5,7 @@ description: Reusable MAOps Docker release discipline for maops-docker-platform 
 
 # Release Readiness
 
-Reusable release procedure. As of Day 4, no CI and no container registry
+Reusable release procedure. As of Day 5, no CI and no container registry
 exist — do not claim otherwise, and do not scaffold either early. Steps
 that reference a PR/tag/release describe the eventual full-portfolio
 process; this repository's own current-day rule (see `.claude/CLAUDE.md`)
@@ -61,7 +61,29 @@ from the user in that conversation.**
    per release for a human-observed sanity check, but it is no longer the
    only evidence.
 
-7. **Image audit and reproducibility (Day 4)** — `make image-audit`
+7. **Reliability (Day 5)** — `make reliability-check`
+   (`scripts/reliability/reliability_check.py`), now part of the automated
+   `make release-check` chain: proves CPU/memory/PID resource limits and
+   the bounded `on-failure:3` restart policy are genuinely applied to real
+   Compose-created containers (not merely declared), a real
+   `docker pause`/`unpause` adversarial proof that the Day 5 timeout-
+   hierarchy invariant (`config/platform.json`'s
+   `gateway_upstream_timeout_seconds` >
+   `state_dependency_timeout_seconds` + `timeout_safety_margin_seconds`,
+   closing Day 3 finding A-6) genuinely bounds a `state` outage's
+   failure-detection latency, a real kernel-initiated OOM-kill (a genuine
+   SIGKILL, deliberately not `docker kill`/`docker stop` — those are
+   exempted from the restart-policy engine, see `docs/reliability.md`)
+   crash on `state` with automatic (never manual) bounded restart and
+   persisted-value survival, a real intentional-stop-does-not-auto-restart
+   proof, and
+   `app`-down/`gateway`-down failure isolation. Does not duplicate
+   anything `compose-test` already proves (topology, DNS, network
+   segmentation, persistence, config mounting, runtime hardening, the H-1
+   matrix, startup ordering, the existing `state`-stop/degrade/recover
+   scenario) — see `docs/reliability.md`.
+
+8. **Image audit and reproducibility (Day 4)** — `make image-audit`
    (`scripts/build/image_audit.py`) validates release-image-specific
    invariants (exact tag/version, non-root user, truthful OCI metadata,
    all three service packages present, `/data` ownership, image-level
@@ -74,7 +96,7 @@ from the user in that conversation.**
    produce the same image ID — treat a claimed "reproducible build" as
    unproven until this actually runs and passes.
 
-8. **Supply chain (Day 4)** — `make sbom`/`sbom-check` (Syft, SPDX JSON)
+9. **Supply chain (Day 4)** — `make sbom`/`sbom-check` (Syft, SPDX JSON)
    and `make vuln-scan` (Trivy, JSON) scan the exact release image via a
    `docker save` archive, using scanner images pinned by exact digest in
    `security/scanners.lock`, neither ever given the Docker socket.
@@ -88,13 +110,13 @@ from the user in that conversation.**
    `sbom-check` + `vuln-scan` as one convenience target outside
    `release-check`'s own chain.
 
-9. **Independent reviews** — before treating a version as release-ready,
-   route the diff through the relevant project agents
-   (`docker-architect`, `container-security-reviewer`,
-   `compose-platform-engineer`, `docker-test-engineer`,
-   `release-engineer`) for a second opinion beyond the automated checks.
+10. **Independent reviews** — before treating a version as release-ready,
+    route the diff through the relevant project agents
+    (`docker-architect`, `container-security-reviewer`,
+    `compose-platform-engineer`, `docker-test-engineer`,
+    `release-engineer`) for a second opinion beyond the automated checks.
 
-10. **Blocker remediation** — fix anything a review or check flagged,
+11. **Blocker remediation** — fix anything a review or check flagged,
     then re-run the affected steps (not just the one that failed — a fix
     can have side effects on earlier steps). A genuinely unavoidable
     vulnerability-policy finding (no fix available, base digest already
@@ -102,23 +124,23 @@ from the user in that conversation.**
     `.claude/CLAUDE.md` — never silenced via a `.trivyignore` or a
     loosened policy threshold.
 
-11. **`make release-check`** — the single composed gate (`quality
+12. **`make release-check`** — the single composed gate (`quality
     (test -> lint -> dockerfile-check -> compose-check) -> build ->
     inspect -> image-audit -> smoke -> security-check -> compose-test ->
-    reproducibility-check -> sbom -> sbom-check -> vuln-scan`). Every
-    failure must propagate; nothing in this chain may silently swallow a
-    nonzero exit code.
+    reliability-check -> reproducibility-check -> sbom -> sbom-check ->
+    vuln-scan`). Every failure must propagate; nothing in this chain may
+    silently swallow a nonzero exit code.
 
-12. **PR** — only when the user explicitly asks for one. Do not create a
+13. **PR** — only when the user explicitly asks for one. Do not create a
     GitHub repository, PR, tag, or release on your own initiative.
 
-13. **Merged-main validation** — once a PR exists and is merged (future
+14. **Merged-main validation** — once a PR exists and is merged (future
     day, explicit instruction only), re-run this entire procedure against
     `main` before tagging — a passing PR branch is not itself proof that
     `main` post-merge is releasable.
 
-14. **Tag/release** — only when the user explicitly asks for it, and only
-    after step 13 passes on `main`.
+15. **Tag/release** — only when the user explicitly asks for it, and only
+    after step 14 passes on `main`.
 
 ## What this skill does not cover
 

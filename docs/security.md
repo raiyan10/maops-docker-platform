@@ -363,9 +363,21 @@ segmentation proofs it also performs.
   package-manager absence, pip/setuptools absence, expected Python
   executable).
 
+## Day 5 addition: resource limits (not a security-hardening claim)
+
+`compose.yaml` now declares explicit CPU/memory/PID limits and a bounded
+restart policy on all three services, genuinely applied to real
+containers. This is a **reliability** property, not a runtime-hardening
+one in the sense the rest of this document uses — it bounds resource
+*consumption* and *failure recovery*, not attack surface — so the full
+design, the config-load-time A-6 timeout-hierarchy fix, and the real
+crash/restart/pause proofs live in `docs/reliability.md`, not here. The
+[A]/[B]/[C]/[D] evidence-tier discipline this document established is
+reused there for the resource/restart proofs (`[C]` real `docker inspect
+HostConfig` values, best-effort `[D]` cgroup v2 corroboration).
+
 ## Day 4 limitations (deliberately not implemented yet)
 
-- No resource limits (CPU/memory) — planned for Day 5.
 - No CI-enforced verification — gates are local (`make release-check`)
   only; Day 6 adds CI/CD.
 - No cryptographic build provenance/attestation/signing — deferred past

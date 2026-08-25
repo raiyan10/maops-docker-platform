@@ -227,10 +227,15 @@ this document's existing scope (runtime platform behavior, not supply-
 chain scanning, which lives entirely in `scripts/security/` - see
 `docs/supply-chain.md`):
 
-- `check_kernel_readonly_write_fails`'s "service kept serving" probe is
-  now genuinely role-aware (`role=name` dispatches to
-  `state.healthcheck`/`app.healthcheck`/`gateway.healthcheck` per
-  container), closing Day 3 finding A-2.
+- `check_kernel_readonly_write_fails`'s "service kept serving" probe
+  dispatches to each container's own healthcheck module by name
+  (`role=name` selects `state.healthcheck`/`app.healthcheck`/
+  `gateway.healthcheck`) - but the property that actually closes Day 3
+  finding A-2 is the Day 4 H-1 fix: each `/healthz` now carries a `role`
+  field and each healthcheck module rejects a wrong-role response, so
+  role-aware *dispatch* has real discriminating power instead of merely
+  selecting a same-shaped probe against every container regardless of its
+  real role. See `docs/security.md`'s "Role-aware liveness" section.
 - A real, live `docker network inspect` proof that `backend.Internal ==
   true` and `edge.Internal == false`, closing Day 3 finding A-3 - see
   `docs/networking.md`.
@@ -238,17 +243,35 @@ chain scanning, which lives entirely in `scripts/security/` - see
   termination now reaches the script's own `finally` teardown instead of
   silently orphaning the stack, closing Day 3 finding A-5.
 
-## What is explicitly not implemented yet (Day 5+)
+## Day 5 additions to this file's scope
 
-- No CPU/memory resource limits or restart-policy reliability
-  engineering - Day 5.
+`compose.yaml` now also declares explicit CPU/memory/PID resource limits
+(`cpus: 0.50`, `mem_limit: 128m`, `pids_limit: 64`), a bounded restart
+policy (`restart: on-failure:3`), and a `stop_grace_period: 10s`,
+identically on all three services - genuinely applied to real containers,
+not merely declared, proven by `scripts/reliability/reliability_check.py`
+(`make reliability-check`). The health-gated startup-ordering chain, the
+existing `state`-stop/degrade/recover scenario, network segmentation, and
+runtime hardening this document already described are all unchanged and
+still owned entirely by `compose_integration.py`/`make compose-test` -
+`reliability_check.py` does not duplicate any of it. See
+`docs/reliability.md` for the full liveness/readiness contract, the Day 5
+timeout-hierarchy design that closes Day 3 finding A-6, and the real
+crash/restart/pause failure-recovery proofs.
+
+## What is explicitly not implemented yet (Day 6+)
+
 - No CI-enforced verification - Day 6; `make release-check` is the only
   gate today.
 - No container registry or published image - Day 6.
 - No cryptographic build provenance/attestation/signing - deferred past
   Day 4, see `docs/build-security.md`.
+- No metrics endpoint, structured logging pipeline, or tracing - Day 5's
+  actual scope was health/reliability/resource controls, not an
+  observability stack; see `docs/reliability.md`'s own scope-boundary
+  section.
 
 Do not read any bullet in this section as already implemented - see
-`docs/roadmap.md` for the authoritative day-by-day scope. Day 4
-(`docs/build-security.md`, `docs/supply-chain.md`) is implemented as of
-this document's current revision.
+`docs/roadmap.md` for the authoritative day-by-day scope. Day 5
+(`docs/reliability.md`) is implemented as of this document's current
+revision.

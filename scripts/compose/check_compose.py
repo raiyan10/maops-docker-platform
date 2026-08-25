@@ -6,13 +6,24 @@ invariants specific to *this* project's `compose.yaml` (exactly three
 services, `app`/`gateway`/`state` naming, hardening flags, health/
 dependency wiring, network topology and isolation, the named persistence
 volume, the mounted platform config, upstream-target-vs-real-service
-cross-checks, image-version consistency with `VERSION`) against the
+cross-checks, image-version consistency with `VERSION`), plus (Day 5, see
+docs/reliability.md) explicit CPU/memory/PID resource limits, a bounded
+`on-failure:3` restart policy, and a `stop_grace_period`, against the
 *rendered* configuration (`docker compose config --format json`), parsed
 with Python stdlib `json` rather than adding a YAML dependency. It is
 deliberately not a general-purpose Compose linter and does not replace
 `docker compose config`'s own YAML-syntax validation (which this script
 also exercises, implicitly, by shelling out to it and failing loudly on a
 nonzero exit).
+
+Day 5's `_parse_duration_seconds()` is deliberately tolerant of more than
+one JSON shape for `stop_grace_period` - Compose's `Duration` type has
+rendered as either a nanosecond integer or a Go-duration string
+(`"10s"`) across different `docker compose` versions, and this project's
+own pre-existing `check_healthchecks()` above already avoided depending on
+a single fixed shape for the structurally identical `interval`/`timeout`/
+`start_period` fields for the same reason - it checks only `test`, never
+their numeric values.
 
 This is a *static/structural* check only: it proves what Compose was
 *asked* to run, not what the resulting containers actually do at runtime
@@ -53,6 +64,16 @@ EXPECTED_NETWORK_NAMES = {"edge", "backend"}
 EXPECTED_VOLUME_NAMES = {"state_data"}
 EXPECTED_CONFIG_NAMES = {"platform"}
 CONFIG_TARGET = "/etc/maops/platform.json"
+
+# Day 5 reliability targets (see docs/reliability.md) - explicit,
+# reviewable resource/restart/shutdown bounds applied identically to all
+# three services, unless real evidence requires a documented adjustment.
+EXPECTED_CPUS = 0.50
+EXPECTED_MEM_LIMIT_BYTES = 128 * 1024 * 1024
+EXPECTED_PIDS_LIMIT = 64
+EXPECTED_RESTART_POLICY_NAME = "on-failure"
+EXPECTED_RESTART_MAX_ATTEMPTS = 3
+EXPECTED_STOP_GRACE_PERIOD_SECONDS = 10
 
 
 class Finding:
@@ -389,6 +410,167 @@ def check_config_object(config: dict) -> list[Finding]:
     return findings
 
 
+def _parse_cpus(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_bytes(value: object) -> int | None:
+    """`mem_limit` renders as a numeric *string* in `docker compose config
+    --format json` (empirically confirmed against this project's own
+    Docker Compose install - e.g. `"134217728"`, not the bare integer
+    `pids_limit` renders as) - both shapes are accepted here rather than
+    assuming either one, the same defensive-parsing approach
+    `_parse_duration_seconds()` below already takes for the structurally
+    similar `stop_grace_period` field."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+_DURATION_STRING_PATTERN = re.compile(
+    r"^(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+(?:\.\d+)?)s)?$"
+)
+
+
+def _parse_duration_seconds(value: object) -> float | None:
+    """Tolerant parser: `docker compose config --format json` renders
+    Compose's Duration type as a nanosecond integer in some versions and a
+    Go-duration string (e.g. "10s") in others - this project's own
+    check_healthchecks() above deliberately never depended on a single
+    fixed shape for a Duration field, for the same reason. Magnitude alone
+    disambiguates an integer/float: this project's own expected grace
+    period (10s) is nowhere near the nanosecond range a real Duration would
+    render at (10s == 10_000_000_000ns), so anything above 3600 is treated
+    as nanoseconds, anything else as whole seconds."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1_000_000_000 if value > 3600 else float(value)
+    if isinstance(value, str):
+        match = _DURATION_STRING_PATTERN.match(value.strip())
+        if not match or not value.strip():
+            return None
+        parts = match.groupdict()
+        if not any(parts.values()):
+            return None
+        return (
+            int(parts["hours"] or 0) * 3600
+            + int(parts["minutes"] or 0) * 60
+            + float(parts["seconds"] or 0)
+        )
+    return None
+
+
+def check_resource_limits(config: dict) -> list[Finding]:
+    """Day 5: every service must have an explicit, reviewable CPU/memory/PID
+    limit - real Docker HostConfig values a plain `docker compose up`
+    applies (the non-Swarm `cpus`/`mem_limit`/`pids_limit` fields), not a
+    Swarm-only `deploy.resources.limits` block ordinary Compose ignores.
+    Rejects a missing limit, a zero/unlimited value, a negative value, and
+    unreasonably permissive drift beyond the approved targets."""
+    findings: list[Finding] = []
+    for name, service in config.get("services", {}).items():
+        cpus = _parse_cpus(service.get("cpus"))
+        if cpus is None or cpus <= 0:
+            findings.append(Finding(f"service {name!r}: cpus is missing/zero/invalid: {service.get('cpus')!r}"))
+        elif cpus > EXPECTED_CPUS:
+            findings.append(
+                Finding(f"service {name!r}: cpus={cpus} exceeds the approved target {EXPECTED_CPUS}")
+            )
+
+        mem_limit = _parse_bytes(service.get("mem_limit"))
+        if mem_limit is None or mem_limit <= 0:
+            findings.append(
+                Finding(f"service {name!r}: mem_limit is missing/zero/invalid: {service.get('mem_limit')!r}")
+            )
+        elif mem_limit > EXPECTED_MEM_LIMIT_BYTES:
+            findings.append(
+                Finding(
+                    f"service {name!r}: mem_limit={mem_limit} bytes exceeds the approved target "
+                    f"{EXPECTED_MEM_LIMIT_BYTES} bytes"
+                )
+            )
+
+        pids_limit = _parse_bytes(service.get("pids_limit"))
+        if pids_limit is None or pids_limit <= 0:
+            findings.append(
+                Finding(f"service {name!r}: pids_limit is missing/zero/unlimited: {service.get('pids_limit')!r}")
+            )
+        elif pids_limit > EXPECTED_PIDS_LIMIT:
+            findings.append(
+                Finding(f"service {name!r}: pids_limit={pids_limit} exceeds the approved target {EXPECTED_PIDS_LIMIT}")
+            )
+    return findings
+
+
+def check_restart_policy(config: dict) -> list[Finding]:
+    """Day 5: every service must have a bounded `on-failure:<N>` restart
+    policy - never absent, never `always`/`unless-stopped` (which would
+    also restart after an intentional stop or on every host reboot
+    regardless of failure), and never an unbounded/missing retry count."""
+    findings: list[Finding] = []
+    for name, service in config.get("services", {}).items():
+        restart = service.get("restart")
+        if not isinstance(restart, str) or not restart.startswith(f"{EXPECTED_RESTART_POLICY_NAME}:"):
+            findings.append(
+                Finding(
+                    f"service {name!r}: restart is {restart!r}, expected "
+                    f"'{EXPECTED_RESTART_POLICY_NAME}:{EXPECTED_RESTART_MAX_ATTEMPTS}'"
+                )
+            )
+            continue
+        _, _, raw_count = restart.partition(":")
+        try:
+            max_attempts = int(raw_count)
+        except ValueError:
+            findings.append(Finding(f"service {name!r}: restart retry count is not an integer: {restart!r}"))
+            continue
+        if max_attempts != EXPECTED_RESTART_MAX_ATTEMPTS:
+            findings.append(
+                Finding(
+                    f"service {name!r}: restart max attempts is {max_attempts}, "
+                    f"expected {EXPECTED_RESTART_MAX_ATTEMPTS}"
+                )
+            )
+    return findings
+
+
+def check_stop_grace_period(config: dict) -> list[Finding]:
+    """Day 5: every service must declare an explicit, bounded
+    stop_grace_period - giving the role's existing SIGTERM handler a real
+    window to exit cleanly before Docker escalates to SIGKILL."""
+    findings: list[Finding] = []
+    for name, service in config.get("services", {}).items():
+        raw = service.get("stop_grace_period")
+        seconds = _parse_duration_seconds(raw)
+        if seconds is None or seconds <= 0:
+            findings.append(Finding(f"service {name!r}: stop_grace_period is missing/zero/invalid: {raw!r}"))
+        elif seconds != EXPECTED_STOP_GRACE_PERIOD_SECONDS:
+            findings.append(
+                Finding(
+                    f"service {name!r}: stop_grace_period={seconds}s, expected "
+                    f"{EXPECTED_STOP_GRACE_PERIOD_SECONDS}s"
+                )
+            )
+    return findings
+
+
 def check_upstream_targets(config: dict) -> list[Finding]:
     """Cross-checks gateway's UPSTREAM_HOST and app's STATE_HOST against the
     real service set, the real target port, AND the real shared network -
@@ -474,6 +656,9 @@ def main() -> int:
         check_state_volume,
         check_config_object,
         check_upstream_targets,
+        check_resource_limits,
+        check_restart_policy,
+        check_stop_grace_period,
     ]
 
     all_findings: list[Finding] = []

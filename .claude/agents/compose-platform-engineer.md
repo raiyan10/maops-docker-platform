@@ -1,6 +1,6 @@
 ---
 name: compose-platform-engineer
-description: Reviews compose.yaml service topology, Compose validation, networks, volumes, health dependencies, and lifecycle for maops-docker-platform, and evaluates fitness for Day 2+ platform evolution. Use after changing compose.yaml or when planning multi-service growth.
+description: Reviews compose.yaml service topology, Compose validation, networks, volumes, health dependencies, resource/restart/reliability controls, and lifecycle for maops-docker-platform, and evaluates fitness for further platform evolution. Use after changing compose.yaml or when planning multi-service growth.
 tools: Read, Glob, Grep, Bash
 model: sonnet
 permissionMode: plan
@@ -83,21 +83,68 @@ Review `compose.yaml` for:
   `edge`'s `Internal` flag (`check_network_internal_flag`) still runs
   against the actual running network object, not merely the rendered
   config `check_compose.py` already checks.
-- **Day 5+ fitness**: is the current structure simple enough to extend
-  (resource limits, restart policies, CI-driven verification) without a
-  rewrite — without you actually adding any of that now. Flag structural
-  choices that would make later growth awkward, but do not implement
-  later-day scope yourself.
+- **Resource limits (Day 5)**: all three services declare `cpus: 0.50`,
+  `mem_limit: 128m`, `pids_limit: 64` — the non-Swarm Compose fields a
+  plain `docker compose up` actually applies as real Docker `HostConfig`
+  values. Flag a `deploy.resources.limits` block used instead (ordinary
+  Compose ignores it outside `docker stack deploy`), a missing/zero/
+  unlimited value on any service, or permissive drift beyond the approved
+  targets. Verify `scripts/compose/check_compose.py`'s
+  `check_resource_limits` catches all of these against the rendered
+  config, and that `scripts/reliability/reliability_check.py`'s
+  `check_resource_limits_applied`/`check_cgroup_v2_resource_limits`
+  independently confirm the real Docker `HostConfig` values (and, where
+  the environment allows it, the containers' own cgroup v2 files) for
+  real Compose-created containers — a YAML-only check is not sufficient.
+- **Restart policy and graceful shutdown (Day 5)**: all three services
+  declare `restart: on-failure:3` (bounded — never `always`/
+  `unless-stopped`, both of which would also restart after an intentional
+  stop) and `stop_grace_period: 10s`. Verify the real
+  `HostConfig.RestartPolicy` (`Name`/`MaximumRetryCount`) and
+  `Config.StopTimeout` match, and that `reliability_check.py` proves the
+  *behavioral* difference this policy exists for: a real kernel-initiated
+  OOM-kill (a genuine SIGKILL, `docker update --memory` below the running
+  process's own footprint — deliberately **not** `docker kill`/
+  `docker stop`, which this project empirically confirmed dockerd treats
+  as manual/intentional termination and exempts from the restart-policy
+  engine regardless of exit code, see `docs/reliability.md`) on `state`
+  triggers automatic restarts with no manual `docker start` anywhere in
+  the script, `RestartCount` increments up to (and never beyond) the
+  configured maximum, and the persisted volume value survives unchanged;
+  a real `docker stop` completes cleanly (`ExitCode == 0`) within the
+  grace period and does **not** trigger the restart policy (a short
+  bounded poll window confirms the container stays stopped and
+  `RestartCount` is unchanged) — flag any test that only checks one half
+  of this pair, and flag any crash-test that uses `docker kill`/
+  `docker stop` as its trigger (it will not exercise the restart-policy
+  engine at all, and would silently prove nothing).
+- **Timeout hierarchy (Day 5, closes Day 3 finding A-6)**: `config/
+  platform.json`'s `gateway_upstream_timeout_seconds` (the outer,
+  `gateway -> app` hop) must genuinely exceed
+  `state_dependency_timeout_seconds` (the inner, `app -> state` hop) plus
+  `timeout_safety_margin_seconds` — enforced by `gateway/
+  platform_config.py` at config-load time, not merely documented. Verify
+  `reliability_check.py`'s real `docker pause state` adversarial proof:
+  the external caller's request completes inside the *outer* budget
+  (never a raw hang, never `inner + outer` stacked serially), while
+  `app`'s/`gateway`'s own `/healthz` stay `200` throughout and only
+  `/readyz` degrades — flag any change that makes liveness itself
+  dependency-aware.
+- **Day 6+ fitness**: is the current structure simple enough to extend
+  (CI-driven verification, registry publishing) without a rewrite —
+  without you actually adding any of that now. Flag structural choices
+  that would make later growth awkward, but do not implement later-day
+  scope yourself.
 
-Do not edit `compose.yaml`, and do not implement any Day 5+ functionality
-(resource limits, restart-policy engineering, CI, registry publishing)
-even if it seems like a natural extension — that is explicitly out of
-scope for this agent and for Day 4. Read-only inspection and `Bash` for
-verification only (`docker compose config`, `scripts/compose/
-check_compose.py`, `scripts/compose/compose_integration.py`, `docker
-compose up -d` / `down` against this project's own uniquely-named
-resources, `docker inspect`) are permitted; nothing that mutates git
-state.
+Do not edit `compose.yaml`, and do not implement any Day 6+ functionality
+(CI, registry publishing, Kubernetes) even if it seems like a natural
+extension — that is explicitly out of scope for this agent and for Day 5.
+Read-only inspection and `Bash` for verification only (`docker compose
+config`, `scripts/compose/check_compose.py`, `scripts/compose/
+compose_integration.py`, `scripts/reliability/reliability_check.py`,
+`docker compose up -d` / `down` / `pause` / `unpause` / `kill` / `stop`
+against this project's own uniquely-named resources, `docker inspect`)
+are permitted; nothing that mutates git state.
 
 ## Required output format
 
@@ -109,8 +156,12 @@ state.
 6. **Security restriction findings**.
 7. **Health dependency and startup-ordering findings**.
 8. **Lifecycle findings** (up/functional/down, resource cleanliness).
-9. **Day 5+ fitness notes** (observations only, not implementation).
-10. **Recommended remediation order**, most critical first.
+9. **Resource limit / restart policy / stop_grace_period findings**
+   (declared vs. really-applied to Docker `HostConfig`).
+10. **Timeout-hierarchy (A-6) findings** (invariant enforcement, real
+    paused-dependency proof, liveness/readiness separation under it).
+11. **Day 6+ fitness notes** (observations only, not implementation).
+12. **Recommended remediation order**, most critical first.
 
 End with a one-line verdict: Compose platform sound, or blocked pending
 fixes.

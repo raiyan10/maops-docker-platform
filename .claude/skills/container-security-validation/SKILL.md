@@ -127,8 +127,19 @@ with a small stdlib-only one-liner - never a shell, never a bare
    trusting a docstring claim. Both scanner images must be pinned by
    exact digest in `security/scanners.lock`.
 
+## Resource limits, restart policy, and timeout hierarchy (Day 5) are out of this skill's scope
+
+`compose.yaml`'s CPU/memory/PID limits, `restart: on-failure:3`,
+`stop_grace_period`, and `config/platform.json`'s timeout-hierarchy
+invariant are reliability engineering, not runtime hardening in this
+skill's [A]/[B]/[C]/[D] sense — they bound resource consumption and
+failure recovery, not attack surface. See `docs/reliability.md` and
+`compose-validation`'s own "Day 5 additions" section for that procedure;
+`make reliability-check` is the automated equivalent of this skill's
+`make security-check` for those properties.
+
 ## Extending this skill
 
-When a later day adds resource limits, seccomp profiles, or additional
-namespaces, add a new numbered check here in the same [A]/[B]/[C]/[D]
-style rather than inventing a different reporting convention.
+When a later day adds seccomp profiles or additional namespaces, add a
+new numbered check here in the same [A]/[B]/[C]/[D] style rather than
+inventing a different reporting convention.

@@ -36,7 +36,7 @@ specific day's scope explicitly calls for an application change.
   the `UPSTREAM_HOST`-vs-real-service cross-check, and the Compose-managed
   [D] read-only-write proof). See `docs/networking.md`,
   `docs/configuration.md`, and `docs/persistence.md`.
-- **Day 4 (v0.4.0, this scope)** — build/image security and
+- **Day 4 (v0.4.0)** — build/image security and
   reproducibility: a deterministic BuildKit/buildx release build
   (`SOURCE_DATE_EPOCH`-normalized, verified byte-identical across two
   independent builds), image-level application-source immutability
@@ -47,7 +47,25 @@ specific day's scope explicitly calls for an application change.
   scanners pinned by exact digest and never given the Docker socket, an
   explicit vulnerability policy, and a multi-role chain smoke test. See
   `docs/build-security.md` and `docs/supply-chain.md`.
-- **Day 5** — health, reliability, resource limits, observability.
+- **Day 5 (v0.5.0, this scope)** — health, reliability, resource
+  controls: liveness (`/healthz`) vs. readiness (`/readyz`) formalized as
+  a platform-wide contract (liveness never calls a dependency; readiness
+  is honestly chained); an explicit two-hop timeout-budget hierarchy
+  (`state_dependency_timeout_seconds` < `gateway_upstream_timeout_seconds`
+  by at least `timeout_safety_margin_seconds`, validated at config-load
+  time) closing Day 3 finding A-6 (cross-hop timeout stacking); explicit
+  Compose CPU/memory/PID resource limits and a bounded `on-failure:3`
+  restart policy plus `stop_grace_period` on all three services, applied
+  to real containers, not merely declared; and a dedicated
+  `scripts/reliability/reliability_check.py` (`make reliability-check`)
+  proving all of the above against real Docker behavior — a real `docker
+  pause` on `state` (bounded controlled failure, then automatic
+  recovery), a real kernel-initiated OOM-kill crash (a genuine SIGKILL,
+  deliberately not `docker kill`/`docker stop` — dockerd exempts both
+  from the restart-policy engine regardless of exit code, confirmed
+  empirically) with automatic (never manual), bounded restart and
+  persisted-state survival, and a real intentional-stop-does-not-
+  auto-restart proof. See `docs/reliability.md`.
 - **Day 6** — CI/CD, integration, release engineering.
 - **Day 7** — hardening, reviews, portfolio showcase -> v1.0.0.
 
@@ -71,19 +89,21 @@ implement a later day's scope early, even if it looks convenient.
   `maops-docker-platform:<VERSION>` release image),
   `maops-smoke-net-<uuid>` (a throwaway Docker *network*, for the
   multi-role chain smoke test), or — for Compose-managed resources —
-  `maops-compose-<uuid>` as the Compose *project* name) generated at run
-  time, and removes only that exact container/network/image/project in a
-  `finally`/equivalent block — never anything it didn't create.
+  `maops-compose-<uuid>` (compose_integration.py) / `maops-reliability-
+  <uuid>` (reliability_check.py) as the Compose *project* name) generated
+  at run time, and removes only that exact container/network/image/project
+  in a `finally`/equivalent block — never anything it didn't create.
 - `make clean` only removes known project-owned generated resources
   (local `__pycache__`/cache directories, the `.cache/` scratch
   directory, any leftover `maops-smoke-*`/`maops-security-*`/
   `maops-image-audit-*` containers, any leftover `maops-smoke-net-*`
   networks, any leftover `maops-repro-*` images/containers, and any
-  leftover `maops-compose-*` Compose projects together with their own
-  named volume, all matching this project's own deterministic naming
-  scheme) — never a broad prune, never another project's resources, and
-  never the named volume of a normal `docker compose up -d` development
-  stack (which uses no `-p maops-compose-*` project name).
+  leftover `maops-compose-*`/`maops-reliability-*` Compose projects
+  together with their own named volume, all matching this project's own
+  deterministic naming scheme) — never a broad prune, never another
+  project's resources, and never the named volume of a normal `docker
+  compose up -d` development stack (which uses no `-p maops-compose-*`/
+  `-p maops-reliability-*` project name).
 - The built release image (`maops-docker-platform:<VERSION>`) is left in
   place intentionally after validation; nothing in this repository's
   tooling removes it automatically.
