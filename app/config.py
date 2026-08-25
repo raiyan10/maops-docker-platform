@@ -89,5 +89,5 @@ def load_config(
         name=name,
         state_host=state_host,
         state_port=state_port,
-        state_timeout_seconds=platform_cfg.dependency_timeout_seconds,
+        state_timeout_seconds=platform_cfg.state_dependency_timeout_seconds,
     )

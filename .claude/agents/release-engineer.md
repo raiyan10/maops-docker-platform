@@ -44,21 +44,41 @@ Review the project for release readiness:
 - **Release-check composition**: `make release-check` actually encodes
   `quality (test -> lint -> dockerfile-check -> compose-check) -> build
   -> inspect -> image-audit -> smoke -> security-check -> compose-test ->
-  reproducibility-check -> sbom -> sbom-check -> vuln-scan` as a real
-  dependency chain in the Makefile (not just documented informally), and
-  every step's failure propagates (no swallowed exit code). `compose-test`
+  reliability-check -> reproducibility-check -> sbom -> sbom-check ->
+  vuln-scan` as a real dependency chain in the Makefile (not just
+  documented informally), and every step's failure propagates (no
+  swallowed exit code). `compose-test`
   (`scripts/compose/compose_integration.py`) must perform real Compose
   runtime verification of all three services — a step that only runs
   `docker compose config` is not sufficient and would silently reopen Day
-  1 finding M-3. `smoke` (`scripts/smoke/container_smoke.py`) exercises
-  the `app` role via a bare `docker run` (verify its `/readyz`
-  expectation is honestly scoped to that isolated context — `state`
-  genuinely doesn't exist there, so a controlled 503 is correct, not a
-  failure) *and*, as of Day 4, a multi-role chain (`state`+`app`+
-  `gateway`, no Compose) — verify both halves still run, and that Make's
-  dependency structure doesn't accidentally rebuild the application image
-  repeatedly (`reproducibility-check`'s own two internal builds are the
-  one deliberate exception).
+  1 finding M-3. `reliability-check` (`scripts/reliability/
+  reliability_check.py`, Day 5) must perform real proof of resource
+  limits/restart policy/stop_grace_period applied to real containers, a
+  real `docker pause`-based adversarial proof that the timeout-hierarchy
+  invariant genuinely bounds a `state` outage's failure latency, and a
+  real kernel-initiated-OOM-kill crash-then-automatic-restart proof
+  (never `docker kill`/`docker stop`, which this project confirmed are
+  exempted from the restart-policy engine — see `docs/reliability.md`) —
+  a step that only parses `compose.yaml` for `cpus`/`restart`/etc. is not
+  sufficient (that is `compose-check`'s job, not `reliability-check`'s). `smoke`
+  (`scripts/smoke/container_smoke.py`) exercises the `app` role via a bare
+  `docker run` (verify its `/readyz` expectation is honestly scoped to
+  that isolated context — `state` genuinely doesn't exist there, so a
+  controlled 503 is correct, not a failure) *and*, as of Day 4, a
+  multi-role chain (`state`+`app`+`gateway`, no Compose) — verify both
+  halves still run, and that Make's dependency structure doesn't
+  accidentally rebuild the application image repeatedly
+  (`reproducibility-check`'s own two internal builds are the one
+  deliberate exception).
+- **Timeout-hierarchy config as a release input (Day 5)**: `config/
+  platform.json`'s `gateway_upstream_timeout_seconds` >
+  `state_dependency_timeout_seconds` + `timeout_safety_margin_seconds`
+  invariant is enforced by `gateway/platform_config.py` at process
+  startup — verify a release with a config file that violates this
+  invariant genuinely fails to start (`gateway` never comes up healthy),
+  rather than silently degrading, and that `reliability_check.py`'s
+  `check_timeout_hierarchy_config` independently re-derives the real
+  shipped values rather than trusting a printed "PASS".
 - **Deterministic build / reproducibility (Day 4)**: `make build` uses
   BuildKit's `rewrite-timestamp=true` export mode with a
   `SOURCE_DATE_EPOCH` derived from the current commit timestamp, never
@@ -76,7 +96,7 @@ Review the project for release readiness:
   `release-check` fail, not pass via a silently added `.trivyignore` or
   loosened policy threshold.
 - **No premature publishing**: no GHCR/Docker Hub configuration, no CI
-  workflow, no tag beyond `v0.3.0`, no `v0.4.0` GitHub release exists yet
+  workflow, no tag beyond `v0.4.0`, no `v0.5.0` GitHub release exists yet
   — confirm nothing in the repository asserts otherwise. Later days
   (Day 6+) will add real CI/registry/release engineering; this agent owns
   reviewing that when it arrives, but must not scaffold it early.

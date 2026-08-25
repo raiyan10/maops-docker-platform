@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
   "platform_name": "maops-docker-platform",
-  "dependency_timeout_seconds": 3.0,
+  "state_dependency_timeout_seconds": 2.0,
+  "gateway_upstream_timeout_seconds": 5.0,
+  "timeout_safety_margin_seconds": 1.0,
   "state_filename": "state.json"
 }

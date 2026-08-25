@@ -22,8 +22,8 @@ export VERSION
 
 .PHONY: help test lint dockerfile-check compose-check quality \
 	build inspect image-audit smoke security-check compose-test \
-	reproducibility-check sbom sbom-check vuln-scan supply-chain-check \
-	release-check clean
+	reliability-check reproducibility-check sbom sbom-check vuln-scan \
+	supply-chain-check release-check clean
 
 help:
 	@echo "Available targets:"
@@ -40,6 +40,7 @@ help:
 	@echo "  smoke                Real-image container smoke test (single-role + multi-role chain)"
 	@echo "  security-check       Hardened-runtime security verification"
 	@echo "  compose-test         Real Compose stack integration test"
+	@echo "  reliability-check    Real Docker resource/restart/timeout-hierarchy/failure-recovery proof"
 	@echo "  reproducibility-check  Independent two-build image-identity reproducibility proof"
 	@echo ""
 	@echo "  sbom                 Generate SPDX JSON SBOM for $(IMAGE) via pinned Syft"
@@ -48,8 +49,8 @@ help:
 	@echo "  supply-chain-check   sbom + sbom-check + vuln-scan"
 	@echo ""
 	@echo "  release-check        quality + build + inspect + image-audit + smoke +"
-	@echo "                       security-check + compose-test + reproducibility-check +"
-	@echo "                       sbom + sbom-check + vuln-scan"
+	@echo "                       security-check + compose-test + reliability-check +"
+	@echo "                       reproducibility-check + sbom + sbom-check + vuln-scan"
 	@echo "  clean                Remove known project-owned generated resources"
 	@echo ""
 	@echo "Image tag is derived from VERSION: $(IMAGE)"
@@ -98,6 +99,9 @@ security-check:
 compose-test:
 	$(PYTHON) scripts/compose/compose_integration.py
 
+reliability-check:
+	$(PYTHON) scripts/reliability/reliability_check.py
+
 reproducibility-check:
 	$(PYTHON) scripts/build/reproducibility_check.py
 
@@ -113,7 +117,7 @@ vuln-scan:
 supply-chain-check: sbom sbom-check vuln-scan
 	@echo "supply-chain-check: sbom + sbom-check + vuln-scan all passed"
 
-release-check: quality build inspect image-audit smoke security-check compose-test reproducibility-check sbom sbom-check vuln-scan
+release-check: quality build inspect image-audit smoke security-check compose-test reliability-check reproducibility-check sbom sbom-check vuln-scan
 	@echo "=== docker compose config ==="
 	docker compose config
 
@@ -136,4 +140,9 @@ clean:
 	@projects="$$(docker ps -a --filter 'name=^maops-compose-' --format '{{.Names}}' | sed -E 's/^(maops-compose-[a-f0-9]+)-(app|gateway|state)-1$$/\1/' | sort -u)"; \
 	if [ -n "$$projects" ]; then \
 		for p in $$projects; do docker compose -p "$$p" -f compose.yaml down -t 5 -v || true; done; \
+	else echo "none found"; fi
+	@echo "removing any leftover maops-reliability-* Compose project resources, including their own named volume (reliability_check.py's own teardown should leave none)"
+	@rprojects="$$(docker ps -a --filter 'name=^maops-reliability-' --format '{{.Names}}' | sed -E 's/^(maops-reliability-[a-f0-9]+)-(app|gateway|state)-1$$/\1/' | sort -u)"; \
+	if [ -n "$$rprojects" ]; then \
+		for p in $$rprojects; do docker compose -p "$$p" -f compose.yaml down -t 5 -v || true; done; \
 	else echo "none found"; fi

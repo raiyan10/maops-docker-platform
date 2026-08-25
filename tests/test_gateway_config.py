@@ -60,7 +60,7 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual(config.upstream_host, DEFAULT_UPSTREAM_HOST)
         self.assertEqual(config.upstream_port, DEFAULT_UPSTREAM_PORT)
         self.assertEqual(config.name, DEFAULT_NAME)
-        self.assertEqual(config.upstream_timeout_seconds, 3.0)
+        self.assertEqual(config.upstream_timeout_seconds, 5.0)
 
     def test_gateway_host_override(self) -> None:
         config = load_config(env={"GATEWAY_HOST": "127.0.0.1"}, platform_config_path=NO_PLATFORM_CONFIG)
@@ -110,15 +110,33 @@ class LoadConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "platform.json"
             config_path.write_text(
-                '{"schema_version": 1, "dependency_timeout_seconds": 0.75}', encoding="utf-8"
+                '{"schema_version": 1, "gateway_upstream_timeout_seconds": 4.5}', encoding="utf-8"
             )
             config = load_config(env={}, platform_config_path=config_path)
-            self.assertEqual(config.upstream_timeout_seconds, 0.75)
+            self.assertEqual(config.upstream_timeout_seconds, 4.5)
 
     def test_invalid_platform_config_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "platform.json"
-            config_path.write_text('{"schema_version": 1, "dependency_timeout_seconds": -1}', encoding="utf-8")
+            config_path.write_text(
+                '{"schema_version": 1, "gateway_upstream_timeout_seconds": -1}', encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                load_config(env={}, platform_config_path=config_path)
+
+    def test_broken_timeout_hierarchy_in_platform_config_propagates(self) -> None:
+        """Closes Day 3 finding A-6: a config file where the outer
+        (gateway) timeout does not exceed the inner (state) timeout plus its
+        safety margin must fail gateway's own config load too, not just be
+        silently tolerated because gateway's own field is individually
+        in-range."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "platform.json"
+            config_path.write_text(
+                '{"schema_version": 1, "gateway_upstream_timeout_seconds": 2, '
+                '"state_dependency_timeout_seconds": 2, "timeout_safety_margin_seconds": 1}',
+                encoding="utf-8",
+            )
             with self.assertRaises(ValueError):
                 load_config(env={}, platform_config_path=config_path)
 

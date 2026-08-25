@@ -16,6 +16,45 @@ application is intentionally tiny — a few JSON endpoints — so that
 essentially all of the engineering effort and all of the review surface
 is the container layer, not application logic.
 
+## Day 5 additions (health, reliability, resource controls)
+
+- **Liveness vs. readiness formalized as a platform-wide contract**:
+  `/healthz` is local-process liveness only on all three services and
+  never calls a dependency (the Day 4 H-1 role-aware fix is unchanged);
+  `/readyz` is honestly chained (`state` -> `app` -> `gateway`, each layer
+  genuinely depending on the one below). See
+  [docs/reliability.md](docs/reliability.md).
+- **Closed Day 3 finding A-6** (cross-hop timeout stacking): the old
+  single, shared `dependency_timeout_seconds` field is replaced by an
+  explicit two-hop timeout budget in `config/platform.json`
+  (`state_dependency_timeout_seconds` for `app`'s inner hop,
+  `gateway_upstream_timeout_seconds` for `gateway`'s outer hop,
+  `timeout_safety_margin_seconds` for the required headroom between
+  them), with the invariant `outer > inner + margin` enforced at
+  config-load time. Proven against a real stalled dependency
+  (`docker pause state`, not a mock) — the external caller's request
+  completes with a controlled failure inside the outer budget, never a
+  raw hang or an `inner + outer` serial wait.
+- **Explicit, reviewable resource controls** on all three services —
+  `cpus: 0.50`, `mem_limit: 128m`, `pids_limit: 64` — the non-Swarm
+  Compose fields a plain `docker compose up` actually applies as real
+  Docker `HostConfig` values, plus a bounded `restart: on-failure:3`
+  policy and a `stop_grace_period: 10s`.
+- A new `scripts/reliability/reliability_check.py` (`make
+  reliability-check`, now part of `make release-check`) proves all of the
+  above against real Docker behavior: resource limits and restart policy
+  applied to real containers, a real `docker pause`/`unpause` adversarial
+  A-6 proof, a real kernel-initiated OOM-kill (a genuine SIGKILL,
+  deliberately not `docker kill`/`docker stop` — see
+  [docs/reliability.md](docs/reliability.md) for why those are exempted
+  from the restart-policy engine) crash with automatic (never manual)
+  bounded restart and persisted-state survival, a real intentional-stop-
+  does-not-auto-restart proof, and `app`-down/`gateway`-down failure
+  isolation — without duplicating anything `make compose-test` already
+  proves.
+- `scripts/compose/check_compose.py` gained three new structural checks
+  (resource limits, restart policy, `stop_grace_period`), 14 -> 17.
+
 ## Day 4 additions (build/image security and reproducibility)
 
 - **Distroless runtime**: the release image's final stage is
@@ -115,7 +154,7 @@ is the container layer, not application logic.
   lifecycle check (see [docs/security.md](docs/security.md)).
 
 See [docs/roadmap.md](docs/roadmap.md) for the full seven-day arc — only
-Days 1-3 are implemented; everything else is explicitly planned, not
+Days 1-5 are implemented; everything else is explicitly planned, not
 built.
 
 ## Prerequisites
@@ -142,7 +181,8 @@ make image-audit                   # project-specific release-image policy audit
 make smoke                           # real-image container smoke test (single-role + multi-role chain)
 make security-check                    # hardened-runtime security verification
 make compose-test                        # real Compose-stack integration test
-make reproducibility-check                 # independent two-build image-identity proof
+make reliability-check                     # real resource/restart/timeout-hierarchy/failure-recovery proof
+make reproducibility-check                   # independent two-build image-identity proof
 
 make sbom                                    # generate SPDX JSON SBOM (Syft)
 make sbom-check                                # validate the generated SBOM
@@ -150,7 +190,8 @@ make vuln-scan                                   # generate Trivy JSON + enforce
 make supply-chain-check                            # sbom + sbom-check + vuln-scan
 
 make release-check   # quality + build + inspect + image-audit + smoke + security-check +
-                      #   compose-test + reproducibility-check + sbom + sbom-check + vuln-scan
+                      #   compose-test + reliability-check + reproducibility-check +
+                      #   sbom + sbom-check + vuln-scan
 
 docker compose up -d                       # run the stack locally (state -> app -> gateway)
 curl http://localhost:8080/readyz            # via the gateway (loopback-only;
@@ -177,9 +218,13 @@ container boundary and PID 1 process model,
 [docs/networking.md](docs/networking.md) for the network segmentation
 proofs, [docs/persistence.md](docs/persistence.md) for the volume/
 read-only-rootfs interaction, [docs/build-security.md](docs/build-security.md)
-for deterministic builds and image-level immutability, and
+for deterministic builds and image-level immutability,
 [docs/supply-chain.md](docs/supply-chain.md) for SBOM generation,
-vulnerability scanning, and this project's explicit vulnerability policy.
+vulnerability scanning, and this project's explicit vulnerability policy,
+and [docs/reliability.md](docs/reliability.md) for the liveness/readiness
+contract, the Day 5 timeout-hierarchy design that closes Day 3 finding
+A-6, resource controls, and the real crash/restart/pause failure-recovery
+proofs.
 
 ## Repository structure
 
@@ -187,28 +232,29 @@ vulnerability scanning, and this project's explicit vulnerability policy.
 app/                     # stdlib-only Python HTTP workload (Day 1 backend)
 gateway/                 # stdlib-only Python gateway (Day 2, sole host-facing service)
 state/                   # stdlib-only Python persistence service (Day 3)
-config/platform.json     # non-secret, Compose-mounted runtime configuration (Day 3)
+config/platform.json     # non-secret, Compose-mounted runtime configuration (Day 3, timeout fields updated Day 5)
 security/scanners.lock   # digest-pinned Syft/Trivy scanner references (Day 4)
 docker/app/Dockerfile    # two-stage: slim builder -> Distroless final runtime, non-root, all three roles
-compose.yaml             # three-service hardened Compose stack (state -> app -> gateway)
-tests/                   # unittest suite (app/ + gateway/ + state/ + Day 4 tooling)
+compose.yaml             # three-service hardened Compose stack (state -> app -> gateway, resource/restart-bounded, Day 5)
+tests/                   # unittest suite (app/ + gateway/ + state/ + Day 4/5 tooling)
 scripts/lint/            # project-specific source + Dockerfile validators
 scripts/compose/         # project-specific Compose structural + integration checks
 scripts/smoke/           # real-image container smoke test (single-role + multi-role)
 scripts/verify/          # runtime security verification
 scripts/build/           # deterministic-build reproducibility proof + image policy audit (Day 4)
 scripts/security/        # SBOM generation/validation + vulnerability scan/policy (Day 4)
+scripts/reliability/     # real resource/restart/timeout-hierarchy/failure-recovery proof (Day 5)
 artifacts/               # generated SBOM/vulnerability-report output (git-ignored)
 docs/                    # architecture, security, networking, configuration,
                          #   persistence, compose platform, build security,
-                         #   supply chain, roadmap
+                         #   supply chain, reliability, roadmap
 .claude/                 # project agents, skills, and guidance
 VERSION                  # single authoritative version source
 ```
 
 ## Current version
 
-`0.4.0` (see `VERSION`) — Day 4 of 7.
+`0.5.0` (see `VERSION`) — Day 5 of 7.
 
 ## Seven-day roadmap (high level)
 
@@ -217,8 +263,8 @@ VERSION                  # single authoritative version source
 | 1 | Secure container foundation |
 | 2 | Compose multi-service topology |
 | 3 | Networking, configuration, volumes, persistence |
-| 4 | Build/image security and reproducibility *(this release)* |
-| 5 | Health, reliability, resources, observability |
+| 4 | Build/image security and reproducibility |
+| 5 | Health, reliability, resource controls *(this release)* |
 | 6 | CI/CD, integration, release engineering |
 | 7 | Hardening, reviews, showcase -> v1.0.0 |
 

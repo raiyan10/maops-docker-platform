@@ -1,6 +1,6 @@
 # Roadmap
 
-Seven-day portfolio arc. Only Days 1-4 are implemented; everything under
+Seven-day portfolio arc. Only Days 1-5 are implemented; everything under
 a later day below is **planned, not implemented** — do not read a later
 day's bullet list as describing current behavior.
 
@@ -220,8 +220,13 @@ day's bullet list as describing current behavior.
   testing only ever covered the `app` role.
 - Closed six Day 3 review findings: A-1 (`schema_version` boolean-bypass
   in all three `platform_config.py` modules — `True == 1` in Python), A-2
-  (`check_kernel_readonly_write_fails`'s liveness probe is now genuinely
-  role-aware, not hardcoded to `app.healthcheck`), A-3 (a real, live
+  (`check_kernel_readonly_write_fails`'s "service kept serving" probe now
+  dispatches to each container's own healthcheck module by name, but the
+  property that actually closes A-2 is the Day 4 H-1 fix itself — each
+  `/healthz` now carries a `role` field and each healthcheck module
+  rejects a wrong-role response, so the role-aware *dispatch* has real
+  discriminating power rather than merely selecting a same-shaped probe;
+  see `docs/security.md`'s "Role-aware liveness" section), A-3 (a real, live
   `docker network inspect` proof for `backend`/`edge`'s `Internal` flag
   was added to `compose_integration.py`, closing the doc/automation gap),
   A-4 (`docs/compose-platform.md`'s stale `UPSTREAM_TIMEOUT_SECONDS`
@@ -238,11 +243,74 @@ day's bullet list as describing current behavior.
   attestation/signing, no resource limits, no restart-policy engineering
   — all explicitly Day 5+ scope (see below).
 
-## Day 5 — Health/reliability/resources/observability (planned)
+## Day 5 — Health, reliability, resource controls (v0.5.0, implemented)
 
-Resource limits (CPU/memory), reliability patterns (restart policy
-review, dependency health ordering), and first-pass observability beyond
-the Day 1 `HEALTHCHECK`.
+- Liveness (`/healthz`) vs. readiness (`/readyz`) formalized as an
+  explicit, platform-wide contract rather than an implicit per-service
+  convention: liveness is local-process-only and never calls a
+  dependency; readiness is honestly chained (`state` -> `app` -> `gateway`,
+  each layer's readiness genuinely depends on the one below, never
+  independently faked). The Day 4 H-1 role-aware `/healthz` fix is
+  unchanged and still regression-proven by the real 3x3 healthcheck
+  matrix in `compose_integration.py`.
+- Closed Day 3 finding A-6 (cross-hop timeout stacking): `config/
+  platform.json`'s single, ambiguous `dependency_timeout_seconds` field is
+  replaced by an explicit, named two-hop budget -
+  `state_dependency_timeout_seconds` (app's inner hop),
+  `gateway_upstream_timeout_seconds` (gateway's outer hop), and
+  `timeout_safety_margin_seconds` - with the required invariant
+  (`outer > inner + margin`) enforced at config-*load* time by
+  `gateway/platform_config.py`, not merely documented. Proven against a
+  real stalled dependency (`docker pause state`, not a mock): a
+  state-dependent request through `gateway -> app -> state` returns a
+  controlled failure inside the configured outer budget, genuinely
+  governed by the inner timeout, never a raw hang or an `inner + outer`
+  serial wait. See `docs/reliability.md`.
+- `compose.yaml` now declares explicit, reviewable Compose resource
+  limits (`cpus: 0.50`, `mem_limit: 128m`, `pids_limit: 64`) and a bounded
+  restart policy (`restart: on-failure:3`) plus `stop_grace_period: 10s`
+  on all three services - the non-Swarm Compose fields a plain
+  `docker compose up` actually applies as real Docker `HostConfig` values,
+  not a Swarm-only `deploy.resources.limits` block ordinary Compose
+  ignores.
+- `scripts/compose/check_compose.py` gained three new structural checks
+  (resource limits present/bounded, restart policy present/bounded,
+  stop_grace_period present/bounded) against the rendered Compose config,
+  bringing the total from 14 to 17.
+- A new `scripts/reliability/reliability_check.py` (`make
+  reliability-check`), wired into `make release-check`, is the dedicated
+  runtime home for all of the above plus real crash/restart/intentional-
+  stop/graceful-shutdown proofs, kept as three deliberately distinct
+  lifecycle scenarios (see `docs/reliability.md`): a **transient** real
+  kernel-initiated OOM-kill on `state` (PID 1's own `/proc/1/oom_score_adj`
+  maxed from inside, `mem_limit` never touched - deliberately not
+  `docker kill`/`docker stop`, both confirmed exempted from the
+  restart-policy engine, and not an internal `os.kill(1, SIGKILL)` either,
+  confirmed blocked by the kernel's PID-namespace init-signal-immunity
+  rule) triggers exactly one automatic restart with no manual
+  `docker start`/`stop`/`kill` anywhere in the proof, and `app`/`gateway`
+  readiness and the persisted counter all recover automatically; a
+  **persistent** OOM condition (the memory limit itself lowered and kept
+  lowered) proves the bound instead - `on-failure:3` retries automatically
+  up to exactly 3 times and correctly stops, requiring an explicit
+  operator restart, never described as automatic recovery; an
+  **intentional** `docker stop` is proven to *not* trigger the restart
+  policy at all, and completes cleanly within the grace period; stopping
+  `app` degrades only `gateway`'s readiness (never its liveness), and
+  stopping `gateway` leaves `app`/`state` completely unaffected. This
+  script does not duplicate anything `compose_integration.py` already
+  proved (topology, DNS, network segmentation, persistence, config
+  mounting, runtime hardening, the H-1 matrix, startup ordering, or the
+  existing `state`-stop/degrade/recover scenario) - see
+  `docs/reliability.md` and `docs/compose-platform.md`'s "Day 5
+  additions" section for the exact division of ownership.
+- `VERSION` bumped `0.4.0` → `0.5.0`; the same version-consistency chain
+  extends with no new duplicated version literal.
+- Still no CI, no container registry, no cryptographic build provenance/
+  attestation/signing, no metrics/tracing/log-aggregation observability
+  stack - all explicitly Day 6+ scope (see below) or explicitly out of
+  this release's scope (see `docs/reliability.md`'s own boundary
+  section).
 
 ## Day 6 — CI/CD/integration/release engineering (planned)
 

@@ -86,6 +86,16 @@ model for:
   `pip`/`setuptools` — verify via `scripts/build/image_audit.py`'s real
   exec-attempt/import-attempt proofs, not by trusting the base image's
   reputation for being "shellless."
+- **`stop_grace_period` and the existing SIGTERM design (Day 5)**:
+  `compose.yaml`'s `stop_grace_period: 10s` (all three services) is a
+  Compose/runtime concern, not a Dockerfile one — this agent's job is
+  only to confirm the PID 1 process model this section already reviews
+  (a real, non-deadlocking `SIGTERM`/`SIGINT` handler, identical across
+  `app`/`gateway`/`state`'s `server.py`) is what actually makes that
+  grace period meaningful, rather than the Dockerfile silently relying on
+  the runtime's default SIGKILL-after-10s fallback. Do not review the
+  resource-limit/restart-policy values themselves (`compose-platform-
+  engineer`'s domain — see `docs/reliability.md`).
 
 Do not edit, build-and-push, publish, or run destructive Docker commands.
 Read-only inspection and `Bash` for verification only (e.g. `docker

@@ -80,6 +80,19 @@ Review the image and runtime configuration for:
   source/config, [B] image inspection, [C] Docker runtime inspection, or
   [D] kernel/process verification — a [C]-only claim must never be
   presented as proof of kernel enforcement.
+- **Scope boundary (Day 5)**: `compose.yaml`'s CPU/memory/PID resource
+  limits, restart policy, `stop_grace_period`, and the
+  `config/platform.json` timeout-hierarchy invariant are reliability
+  engineering, not runtime hardening in this document's sense — they
+  bound resource consumption and failure recovery, not attack surface.
+  That review belongs to `compose-platform-engineer`
+  (`docs/reliability.md`), not this agent; do not duplicate it here.
+  Confirm only that nothing about the Day 5 additions weakens any
+  existing hardening property this agent does own (`read_only`,
+  `cap_drop: [ALL]`, `no-new-privileges`, non-root `10001:10001`) — e.g.
+  flag a resource limit low enough to make the process itself unstable
+  (OOM-killed under normal load) as a correctness concern worth raising,
+  even though the limit's *value* is compose-platform-engineer's call.
 
 Do not edit, run destructive commands, or grant/loosen any security
 control. Read-only inspection and `Bash` for verification only (running

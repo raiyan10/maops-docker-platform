@@ -23,17 +23,19 @@ process/shell execution at all):
     upstream. `scripts/compose/`, `scripts/lint/`, `scripts/smoke/`,
     `scripts/verify/`, and `tests/` are never scanned by either rule set
     below — they are Docker-driving/test infrastructure, not workload or
-    the two Day 4 directories this scan was deliberately widened to.
-  * **Tooling** (`scripts/build/`, `scripts/security/` — Day 4's Docker/
-    scanner-driving infrastructure): `subprocess` is explicitly permitted
-    (both directories' whole job is invoking `docker build`/`docker run`/
-    the pinned Syft/Trivy scanner containers) — but `pickle`/`ctypes` are
-    still forbidden (neither directory has any legitimate need for
-    either), and every check below that isn't import-based (eval/exec/
-    os.system/os.popen/shell=True) applies identically to both rule sets.
-    Widening this scan to the tooling directories does not weaken the
-    workload's own restrictions in any way — the two rule sets are kept
-    genuinely separate, not merged into one relaxed policy.
+    the three directories this scan was deliberately widened to (Day 4:
+    `scripts/build/`, `scripts/security/`; Day 5: `scripts/reliability/`).
+  * **Tooling** (`scripts/build/`, `scripts/security/` — Day 4's; and
+    `scripts/reliability/` — Day 5's; Docker/scanner-driving
+    infrastructure): `subprocess` is explicitly permitted (each
+    directory's whole job is invoking `docker build`/`docker run`/`docker
+    compose`/the pinned Syft/Trivy scanner containers) — but `pickle`/
+    `ctypes` are still forbidden (none of the three has any legitimate
+    need for either), and every check below that isn't import-based
+    (eval/exec/os.system/os.popen/shell=True) applies identically to both
+    rule sets. Widening this scan to the tooling directories does not
+    weaken the workload's own restrictions in any way — the two rule sets
+    are kept genuinely separate, not merged into one relaxed policy.
 
 Checks performed, each via the `ast` module (never naive substring
 matching, so e.g. a string literal or a comment mentioning "eval" never
@@ -180,7 +182,11 @@ def _collect_files(scan_dirs: list[Path]) -> list[Path]:
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent.parent
     workload_dirs = [repo_root / "app", repo_root / "gateway", repo_root / "state"]
-    tooling_dirs = [repo_root / "scripts" / "build", repo_root / "scripts" / "security"]
+    tooling_dirs = [
+        repo_root / "scripts" / "build",
+        repo_root / "scripts" / "security",
+        repo_root / "scripts" / "reliability",
+    ]
 
     try:
         workload_files = _collect_files(workload_dirs)
