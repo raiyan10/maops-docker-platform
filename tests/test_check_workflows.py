@@ -281,6 +281,127 @@ class BuildxContainerBuilderBeforeReleaseCheckTests(unittest.TestCase):
         self.assertTrue(any("if: always()" in str(f) for f in findings))
 
 
+GOOD_RELEASE_WITH_CONTEXT = """\
+name: Release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate release context
+        run: |
+          python3 scripts/release/check_release_context.py \\
+            --event-name "${{ github.event_name }}" \\
+            --ref "${{ github.ref }}" \\
+            --tag "${{ github.ref_name }}" \\
+            --commit "${{ github.sha }}" \\
+            --main-ref origin/main
+      - name: make release-check
+        run: make release-check
+  publish:
+    needs: validate
+    if: >-
+      success() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - run: gh release create "$TAG"
+"""
+
+
+class ReleaseContextValidationIsAuthoritativeTests(unittest.TestCase):
+    """Proves the Day 6 release-engineering-review Medium finding stays
+    closed: the workflow_dispatch dry-run's "main-only" intent must be
+    structurally enforced by an unconditional step invoking
+    check_release_context.py with explicit GitHub context, running before
+    the expensive make release-check gate."""
+
+    def setUp(self) -> None:
+        self.module = load_check_workflows()
+
+    def test_good_release_passes(self) -> None:
+        self.assertEqual(
+            self.module.check_release_context_validation_is_authoritative(
+                {"release.yml": GOOD_RELEASE_WITH_CONTEXT}
+            ),
+            [],
+        )
+
+    def test_missing_validate_job_is_rejected(self) -> None:
+        text = "jobs:\n  quality:\n    steps:\n      - run: make quality\n"
+        findings = self.module.check_release_context_validation_is_authoritative({"release.yml": text})
+        self.assertTrue(findings)
+
+    def test_missing_context_step_is_rejected(self) -> None:
+        bad = GOOD_RELEASE_WITH_CONTEXT.replace(
+            "      - name: Validate release context\n"
+            "        run: |\n"
+            '          python3 scripts/release/check_release_context.py \\\n'
+            '            --event-name "${{ github.event_name }}" \\\n'
+            '            --ref "${{ github.ref }}" \\\n'
+            '            --tag "${{ github.ref_name }}" \\\n'
+            '            --commit "${{ github.sha }}" \\\n'
+            "            --main-ref origin/main\n",
+            "",
+        )
+        findings = self.module.check_release_context_validation_is_authoritative({"release.yml": bad})
+        self.assertTrue(any("must run scripts/release/check_release_context.py" in str(f) for f in findings))
+
+    def test_context_step_gated_by_if_is_rejected(self) -> None:
+        """A per-event `if:` on this step would let a non-main
+        workflow_dispatch appear "skipped" rather than fail loudly - exactly
+        the Medium finding this invariant closes."""
+        bad = GOOD_RELEASE_WITH_CONTEXT.replace(
+            "      - name: Validate release context\n        run: |",
+            "      - name: Validate release context\n"
+            "        if: github.event_name == 'workflow_dispatch'\n"
+            "        run: |",
+        )
+        findings = self.module.check_release_context_validation_is_authoritative({"release.yml": bad})
+        self.assertTrue(any("must be unconditional" in str(f) for f in findings))
+
+    def test_context_step_missing_event_name_flag_is_rejected(self) -> None:
+        bad = GOOD_RELEASE_WITH_CONTEXT.replace('--event-name "${{ github.event_name }}" \\\n', "")
+        findings = self.module.check_release_context_validation_is_authoritative({"release.yml": bad})
+        self.assertTrue(any("--event-name" in str(f) for f in findings))
+
+    def test_context_step_missing_ref_flag_is_rejected(self) -> None:
+        bad = GOOD_RELEASE_WITH_CONTEXT.replace('--ref "${{ github.ref }}" \\\n', "")
+        findings = self.module.check_release_context_validation_is_authoritative({"release.yml": bad})
+        self.assertTrue(any("--ref" in str(f) for f in findings))
+
+    def test_context_step_after_release_check_is_rejected(self) -> None:
+        context_step = (
+            "      - name: Validate release context\n"
+            "        run: |\n"
+            '          python3 scripts/release/check_release_context.py \\\n'
+            '            --event-name "${{ github.event_name }}" \\\n'
+            '            --ref "${{ github.ref }}" \\\n'
+            '            --tag "${{ github.ref_name }}" \\\n'
+            '            --commit "${{ github.sha }}" \\\n'
+            "            --main-ref origin/main\n"
+        )
+        release_check_step = "      - name: make release-check\n        run: make release-check\n"
+        bad = GOOD_RELEASE_WITH_CONTEXT.replace(context_step, "").replace(
+            release_check_step, release_check_step + context_step
+        )
+        findings = self.module.check_release_context_validation_is_authoritative({"release.yml": bad})
+        self.assertTrue(any("must run before" in str(f) for f in findings))
+
+
 class RequiredFilesExistTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_check_workflows()

@@ -335,7 +335,12 @@ overall conclusion.
 ## `release.yml`: the controlled release workflow
 
 **Triggers**: `push: tags: v*.*.*` — the real release event — and
-`workflow_dispatch` on `main` — the safe, non-publishing dry run.
+`workflow_dispatch` — the safe, non-publishing dry run. `workflow_dispatch`
+can be invoked by GitHub against *any* ref (a feature branch, `develop`, or
+even a tag ref selected from the "Run workflow" ref picker) — the trigger
+declaration alone cannot restrict that. This project's release contract
+requires the dry run to be authoritative *only* on `main`; see "Manual
+dispatch is main-only" below for how that is actually enforced.
 
 **Concurrency**: `group: release-${{ github.ref }}`, deliberately
 `cancel-in-progress: false`. Interrupting a release mid-publish is exactly
@@ -345,36 +350,74 @@ allowed to queue behind another one for the same ref, never to be killed
 mid-flight by a newer trigger.
 
 **Job graph**: `validate` (always runs, both modes) → `publish` (`needs:
-validate`, real-tag-only). `validate` runs `make release-check` (identical
+validate`, real-tag-only). `validate` first runs
+`scripts/release/check_release_context.py` (an unconditional step — see
+"Manual dispatch is main-only" below — running before the expensive gate so
+an invalid ref/tag/event fails fast), then `make release-check` (identical
 in both modes — a dry run genuinely exercises "the same release-policy
-gates" a real tag event would) and then
-`scripts/release/check_release_context.py` in the mode matching the
-triggering event.
+gates" a real tag event would).
 
-**Release-candidate dry run** (`workflow_dispatch` on `main`):
-`check_release_context.py --mode dry-run` derives the proposed tag from
-`VERSION` (e.g. `VERSION=0.6.0` → proposed tag `v0.6.0`), validates its
-format, and validates the release notes file
+**`check_release_context.py` is the authoritative event distinguisher**:
+the script — not `release.yml`'s own `if:` expressions — decides which
+validation to run, from the real `--event-name` (`GITHUB_EVENT_NAME`) it is
+invoked with: `workflow_dispatch` maps to the dry-run path,
+`push` maps to the real tag path, and any other event fails
+(`determine_mode()`). This is deliberate: trusting a YAML `if:` to select
+the right script mode duplicates the event-routing logic in two places
+(the workflow and the script) that could drift out of sync; here there is
+exactly one place that decides.
+
+**Manual dispatch is main-only — structurally enforced**: `workflow_dispatch`
+can be invoked against any ref, but this project's release contract requires
+the dry run to be authoritative *only* on `refs/heads/main`.
+`check_release_context.py`'s `validate_dispatch_ref()` enforces this by
+exact string equality (never a prefix/regex match, so a ref that merely
+*contains* "main" — a branch named `main-v0.6.0`, or a nested
+`refs/heads/main/sub` — still fails) against the real `--ref`
+(`GITHUB_REF`) the workflow passes it. A `workflow_dispatch` run against
+`refs/heads/feature/...`, `refs/heads/develop`, a tag ref, an empty ref, or
+a malformed ref all fail with a clear, non-zero
+`check_release_context: FAIL: ...` message — the step is unconditional (no
+per-event `if:` gates it), so a non-main dispatch cannot be mistaken for a
+silently-skipped, passing run. `scripts/ci/check_workflows.py`'s
+`check_release_context_validation_is_authoritative()` statically enforces
+that this step exists, is unconditional, passes `--event-name`/`--ref`, and
+runs before `make release-check`. This closes a Day 6
+release-engineering-review Medium finding: the main-only intent was
+previously documented but not structurally enforced (the dry-run script had
+no ref check at all).
+
+**Release-candidate dry run** (`workflow_dispatch`, `refs/heads/main`
+only): once the ref check above passes, `build_dry_run_context()` derives
+the proposed tag from `VERSION` (e.g. `VERSION=0.6.0` → proposed tag
+`v0.6.0`), validates its format, and validates the release notes file
 (`docs/releases/v<VERSION>.md`) already exists — giving real, actionable
-feedback about release readiness *before* the tag is ever created. The
-`publish` job's own `if:` condition (below) makes a dry run structurally
-incapable of reaching publication, regardless of what `validate` reports.
+feedback about release readiness *before* the tag is ever created. It never
+requires a version tag to already exist for a `workflow_dispatch` event.
+The `publish` job's own `if:` condition (below) makes a dry run structurally
+incapable of reaching publication, regardless of what `validate` reports —
+manual dispatch never publishes, main-only or not.
 
-**Real tag validation**: `check_release_context.py --mode tag` additionally
-validates the tag's own format, that the tag exactly matches `VERSION`
-(`VERSION=0.6.0` requires tag `v0.6.0` — `v0.5.0` fails), and — via a real
-`git merge-base --is-ancestor` check against `origin/main` (the checkout
-step uses `fetch-depth: 0` specifically so this has full history to check
-against) — that the tagged commit genuinely belongs to `main`'s history.
-This refuses to publish a release from an arbitrary feature-branch-only
-commit that happens to carry a valid-looking tag.
+**Real tag validation** (a `push` event, a separate path from the dispatch
+ref check above): `build_tag_context()` validates the tag's own format,
+that the tag exactly matches `VERSION` (`VERSION=0.6.0` requires tag
+`v0.6.0` — `v0.5.0` fails), and — via a real `git merge-base
+--is-ancestor` check against `origin/main` (the checkout step uses
+`fetch-depth: 0` specifically so this has full history to check against)
+— that the tagged commit genuinely belongs to `main`'s history. This
+refuses to publish a release from an arbitrary feature-branch-only commit
+that happens to carry a valid-looking tag. Tag publication is a distinct
+event path from the manual dry run described above; a tag push is never
+required to also satisfy the dispatch ref check, and a `workflow_dispatch`
+run is never required to carry a version tag.
 
 **Why the tag/version/history logic lives in a script, not workflow YAML**:
 `scripts/release/check_release_context.py`'s core validation
 (`validate_version_format`, `validate_tag_format`, `tag_matches_version`,
-`validate_release_notes_exist`, `validate_main_history`) is pure,
-Docker-free, git-free logic with a single, separately swappable adapter
-(`is_ancestor`) at the one place real `git` is genuinely needed — see
+`validate_release_notes_exist`, `validate_main_history`,
+`validate_dispatch_ref`, `determine_mode`) is pure, Docker-free, git-free
+logic with a single, separately swappable adapter (`is_ancestor`) at the
+one place real `git` is genuinely needed — see
 `tests/test_check_release_context.py`. Burying this in shell/YAML
 conditionals would make it untestable outside a real GitHub Actions run;
 as a script, it has the same fast, local, `unittest`-verified feedback
@@ -482,8 +525,12 @@ true`; no `|| true` around a gate; required triggers; the `v*.*.*` tag
 pattern; the manual-dispatch-cannot-publish shape; every job reaching
 `make release-check` creates and selects a `docker-container` driver
 Buildx builder beforehand and removes it with `if: always()` afterward
-(see "GitHub-hosted runner Buildx portability" above); no
-registry-publication command; no Day 7+ tooling reference).
+(see "GitHub-hosted runner Buildx portability" above); the
+`check_release_context.py` step is unconditional, passes explicit
+`--event-name`/`--ref` context, and runs before `make release-check` (the
+main-only `workflow_dispatch` dry-run contract, statically checked — see
+"Manual dispatch is main-only" above); no registry-publication command; no
+Day 7+ tooling reference).
 
 **Self-reference, handled deliberately**: `ci.yml`'s own `quality` job runs
 this exact script against its own checked-out copy of `ci.yml` and
@@ -547,7 +594,7 @@ real rather than only by synthetic fixtures.
 ```bash
 make quality          # test, lint, dockerfile-check, compose-check, workflow-check
 make release-check    # the full authoritative gate ci.yml's release-policy job runs
-python3 scripts/release/check_release_context.py --mode dry-run
+python3 scripts/release/check_release_context.py --event-name workflow_dispatch --ref refs/heads/main
 docker compose config
 ```
 

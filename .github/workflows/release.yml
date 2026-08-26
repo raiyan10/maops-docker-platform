@@ -67,6 +67,26 @@ jobs:
             echo "::notice::TAG RELEASE - real release event for tag ${{ github.ref_name }} at commit ${{ github.sha }}."
           fi
 
+      # The authoritative distinguisher between the two trigger events -
+      # not this step's own `if:` (there is none: it always runs) and not a
+      # YAML `if: github.ref == 'refs/heads/main'` guard, which would make a
+      # non-main workflow_dispatch merely "skipped" rather than fail loudly.
+      # check_release_context.py derives its own validation mode from the
+      # real `--event-name`/`GITHUB_EVENT_NAME`, and for workflow_dispatch
+      # rejects every ref except refs/heads/main with a clear, non-zero
+      # failure - the Day 6 release contract's "dry run is main-only" clause,
+      # enforced in code rather than only documented. Runs before the
+      # expensive Buildx/`make release-check` gate below so an invalid
+      # ref/tag/event fails fast, not after several minutes of build work.
+      - name: Validate release context
+        run: |
+          python3 scripts/release/check_release_context.py \
+            --event-name "${{ github.event_name }}" \
+            --ref "${{ github.ref }}" \
+            --tag "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}" \
+            --main-ref origin/main
+
       - name: Show Buildx diagnostics (default builder/driver)
         run: |
           docker buildx version
@@ -109,19 +129,6 @@ jobs:
           else
             echo "builder ${BUILDER_NAME} not found - nothing to remove"
           fi
-
-      - name: Validate release context (dry run)
-        if: github.event_name == 'workflow_dispatch'
-        run: python3 scripts/release/check_release_context.py --mode dry-run
-
-      - name: Validate release context (real tag)
-        if: github.event_name == 'push'
-        run: |
-          python3 scripts/release/check_release_context.py \
-            --mode tag \
-            --tag "${{ github.ref_name }}" \
-            --commit "${{ github.sha }}" \
-            --main-ref origin/main
 
       - name: Upload release evidence (SBOM + vulnerability report)
         if: always()

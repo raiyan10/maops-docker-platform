@@ -34,8 +34,15 @@ runs `make release-check` first creates and selects a job-scoped
 `docker-container` driver Buildx builder (the GitHub-hosted runner's
 default `docker` driver cannot satisfy this project's Day 4 deterministic
 `type=docker,dest=...` exporter - see docs/ci-cd.md) and removes it with
-`if: always()`; no registry-publication command appears; no Day 7+
-tooling reference appears.
+`if: always()`; `release.yml`'s `validate` job runs
+`scripts/release/check_release_context.py` as an unconditional step (no
+`if:` gating it to one event, so a non-main `workflow_dispatch` fails
+loudly rather than appearing "skipped"), invoked with explicit
+`--event-name`/`--ref` GitHub context (the main-only `workflow_dispatch`
+dry-run contract is enforced by that script, not merely by this YAML) and
+before `make release-check` (fail fast on an invalid ref/tag/event, not
+after several minutes of build work); no registry-publication command
+appears; no Day 7+ tooling reference appears.
 """
 
 from __future__ import annotations
@@ -458,6 +465,79 @@ def check_buildx_container_builder_before_release_check(texts: dict[str, str]) -
     return findings
 
 
+def check_release_context_validation_is_authoritative(texts: dict[str, str]) -> list[Finding]:
+    """Closes the Day 6 release-engineering-review Medium finding: the
+    workflow_dispatch dry-run's "main-only" intent must be structurally
+    enforced, not merely documented. This checks that `release.yml`'s
+    `validate` job runs `scripts/release/check_release_context.py`:
+
+    - unconditionally (no per-event `if:` gating it) - a `workflow_dispatch`
+      run against a non-main ref must reach this step and fail loudly, never
+      be silently skipped in a way that could be mistaken for a passing
+      validation;
+    - with explicit `--event-name`/`--ref` GitHub context, so the script
+      itself - not this YAML's own `if:` expressions - is the authoritative
+      distinguisher between the dry-run and tag-push paths and the
+      authoritative enforcer of the main-only dry-run contract;
+    - before `make release-check`, so an invalid ref/tag/event fails fast
+      rather than after several minutes of build work.
+    """
+    findings: list[Finding] = []
+    text = texts.get("release.yml")
+    if text is None:
+        return findings
+    block = job_block(text, "validate")
+    if not block:
+        findings.append(Finding("release.yml: no 'validate' job found to verify release-context validation"))
+        return findings
+
+    steps = list_items(nested_block(block, "steps"))
+    step_texts = ["\n".join(step) for step in steps]
+
+    context_idx = next((i for i, s in enumerate(step_texts) if "check_release_context.py" in s), None)
+    if context_idx is None:
+        findings.append(
+            Finding("release.yml: 'validate' job must run scripts/release/check_release_context.py")
+        )
+        return findings
+
+    context_step = step_texts[context_idx]
+    if re.search(r"^\s*if:", context_step, re.MULTILINE):
+        findings.append(
+            Finding(
+                "release.yml: the check_release_context.py step must be unconditional (no "
+                "per-event 'if:') so a non-main workflow_dispatch fails loudly instead of "
+                "appearing skipped"
+            )
+        )
+    if "--event-name" not in context_step:
+        findings.append(
+            Finding(
+                "release.yml: check_release_context.py must be invoked with explicit "
+                "--event-name (github.event_name) - the script, not a YAML if:, must be the "
+                "authoritative distinguisher between workflow_dispatch and a tag push"
+            )
+        )
+    if "--ref" not in context_step:
+        findings.append(
+            Finding(
+                "release.yml: check_release_context.py must be invoked with explicit --ref "
+                "(github.ref) so the main-only workflow_dispatch dry-run contract is enforced "
+                "in code, not merely documented"
+            )
+        )
+
+    release_check_idx = next((i for i, s in enumerate(step_texts) if "make release-check" in s), None)
+    if release_check_idx is not None and context_idx > release_check_idx:
+        findings.append(
+            Finding(
+                "release.yml: check_release_context.py must run before 'make release-check' so "
+                "an invalid ref/tag/event fails fast, not after several minutes of build work"
+            )
+        )
+    return findings
+
+
 def check_no_registry_publication(texts: dict[str, str]) -> list[Finding]:
     findings = []
     for name, text in texts.items():
@@ -488,6 +568,7 @@ CHECKS = [
     check_manual_dispatch_cannot_publish,
     check_required_triggers,
     check_buildx_container_builder_before_release_check,
+    check_release_context_validation_is_authoritative,
     check_no_registry_publication,
     check_no_day7_plus_tooling,
 ]
