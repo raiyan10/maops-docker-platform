@@ -329,7 +329,29 @@ used as a correctness assertion, no `shell=True`/`os.system`/`os.popen`:
    unit test that injects a failure into the wrapped action and asserts
    the restore call still happened (see `tests/test_reliability_check.py`,
    `WithMemoryShrinkRestoredTests`) — even if the bound assertion itself
-   fails or a `docker` subprocess call raises. Only *after* the bound is
+   fails or a `docker` subprocess call raises.
+
+   **Day 6 (GitHub Actions run `32960673438`, see `docs/ci-cd.md`'s
+   "GitHub-hosted runner post-restart cgroup/runc resource-update race"
+   section for the full record):** both the shrink and the restore now go
+   through `update_container_resources_verified()` — a bounded, monotonic,
+   independently re-inspected retry, narrowly scoped to the EXACT transient
+   `runc`/cgroup v2 race GitHub's Linux runner hit immediately after
+   Scenario 1's automatic restart (never to Docker errors in general — an
+   unrelated `docker update` failure still fails immediately, with no
+   retry). This closes a real GitHub-only failure without touching what
+   Scenario 2 actually proves: the memory limit is still genuinely
+   lowered, the kernel still genuinely OOM-kills `state` on every retry,
+   `on-failure:3` still retries automatically exactly 3 times and no more,
+   and restoration remains a first-class **verified** invariant — a
+   restore that cannot be applied AND confirmed via a follow-up `docker
+   inspect` within the bounded retry deadline still fails
+   `reliability-check`, never merely a warning. Local Docker Desktop
+   succeeds on the first `docker update` attempt, so this adds no
+   observable local behavior change — `make reliability-check` still
+   reports `32/32`.
+
+   Only *after* the bound is
    proven (and the memory limit already restored by that `finally` block)
    does the script issue an explicit `docker compose start state` —
    clearly labeled as the deliberate **operator** action it is, not part

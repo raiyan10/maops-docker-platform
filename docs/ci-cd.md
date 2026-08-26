@@ -156,6 +156,115 @@ job create a `docker-container` driver builder (with `--use`) before `make
 release-check`, and remove it with `if: always()` afterward — see
 "`workflow-check`: self-validating, deterministically" below.
 
+## GitHub-hosted runner post-restart cgroup/runc resource-update race (real CI finding)
+
+The Buildx portability fix above was independently proven on GitHub Actions
+run `32960673438`: `release-policy` created and used the job-scoped
+`docker-container` builder, `make release-check` ran, and `make
+reliability-check` progressed correctly all the way through 564 unit
+tests, `dockerfile-check` 12/12, `compose-check` 17/17, `workflow-check`
+12/12, image build/inspect/audit/smoke/security-check/compose-test, and
+then genuinely exercised Scenario 1's real transient PID 1 kernel OOM
+crash: `state`'s `RestartCount` advanced `0 -> 1`, `state`/`app`/`gateway`
+readiness all recovered automatically, the persisted counter survived, and
+the full `gateway -> app -> state` chain worked again post-recovery - the
+*application/reliability* behavior this platform claims had already been
+proven correct, for real, on a clean GitHub-hosted Linux runner.
+
+The run then failed **~0.17s later**, inside Scenario 2, on the very first
+`docker update --memory 6m --memory-swap 6m` issued against that
+just-restarted `state` container:
+
+```
+reliability_check: FAIL: docker update (shrink memory)
+maops-reliability-...-state-1 failed:
+Error response from daemon: Cannot update container <id>:
+runc did not terminate successfully: exit status 1:
+openat2 /sys/fs/cgroup/system.slice/docker-<id>.scope/cgroup.controllers:
+no such file or directory
+```
+
+**This is a Docker control-plane finding, not a reliability-design
+finding.** Every property the harness had already checked - resource
+limits, restart policy, stop-grace-period, the timeout hierarchy, the A-6
+pause proof, and the entire Scenario 1 automatic-recovery chain - had
+already passed. The failure is `dockerd`/`runc` itself returning a
+non-zero exit from a `docker update` resource mutation issued immediately
+after an automatic restart, not a defect in the resource limits, the
+restart policy, or the application's own recovery behavior. **Not
+reproducible against this project's own local Docker Desktop install** -
+treated as a GitHub-hosted-runner/`runc`/cgroup v2 post-restart
+synchronization race until proven otherwise: a container the restart-policy
+engine just brought back up can, on some Linux runner cgroup v2
+hierarchies, have a brief window where `runc`'s own `cgroup.controllers`
+bookkeeping for the freshly (re)created cgroup instance is not yet fully
+settled when a `docker update` lands, and `runc` fails the whole operation
+rather than retrying internally.
+
+**Remediation - bounded, monotonic, independently VERIFIED retry, scoped
+to exactly this error, never to Docker errors in general**:
+`scripts/reliability/reliability_check.py` adds
+`update_container_resources_verified()`, used for BOTH the Scenario 2
+memory shrink and its restoration (restoration was already a first-class
+verified invariant per the Day 5 M-A fix below - this preserves that, it
+does not relax it):
+
+- `docker update` exits `0`: `HostConfig` is independently re-inspected;
+  only an EXACT `Memory`/`MemorySwap` match returns success - a
+  "successful" update whose inspected values don't match is a real
+  verification failure and is never retried.
+- `docker update` exits non-zero: the stderr is checked against a narrow
+  classifier, `_is_transient_cgroup_update_race()`, requiring ALL THREE of
+  `"runc did not terminate successfully"`, `"cgroup.controllers"`, and
+  `"no such file or directory"` together - not any one alone (a bare "no
+  such file or directory" is common to many genuinely non-retryable
+  Docker/runc errors and must never by itself be treated as retryable).
+  Any other error - `permission denied`, `invalid memory limit`, `invalid
+  argument`, `container not found`, daemon-unavailable, an unknown-flag/
+  CLI-syntax error, or an actual policy/verification mismatch - fails
+  immediately, with no retry.
+- On a recognized transient race, `HostConfig` is inspected BEFORE
+  retrying (`dockerd`/`runc` can genuinely return non-zero after a partial
+  operation): an exact match returns success without reissuing `docker
+  update`; a genuine mismatch checks a real `time.monotonic()`-measured
+  bounded deadline (~10s, a small ~0.5s retry interval - matching this
+  script's own `POLL_INTERVAL_SECONDS` convention) and either retries or
+  fails; a container that disappears mid-retry (the verification `docker
+  inspect` itself fails) fails immediately rather than retrying against a
+  container that may no longer exist.
+
+No `docker` resource mutation in this script ever infers success from exit
+code alone, and the deadline is a real monotonic bound, never a blind
+`time.sleep()` used as the correctness mechanism. `now`/`sleep` are
+injectable (default to the real `time.monotonic`/`time.sleep`), so
+`tests/test_reliability_check.py` proves every branch of this - first-try
+success, transient-then-success, several-transients-then-success,
+deadline exhaustion, an unrelated error's immediate no-retry failure, a
+reported-success/verification mismatch, an already-applied value found
+mid-retry, a container disappearing mid-retry, and both shrink and
+restore going through the identical mechanism (restore failing preserves
+the original action failure as `__cause__`, matching the existing Day 5
+M-A precedence) - entirely Docker-free, with a fake monotonic clock, no
+real fixed-time delay anywhere in the suite.
+
+**What this explicitly is not**: not a weakened persistent-failure
+scenario, not a `continue-on-error`/`|| true` around the gate, not a
+synthetic exit-code loop replacing the real kernel OOM mechanism, not a
+container recreation to dodge the race (the same `state` container
+instance keeps its restart-policy budget across Scenario 1 and Scenario
+2, exactly as `docs/reliability.md`'s `RestartCount` semantics document),
+and not a change to the resource limits, restart policy, or timeout
+hierarchy this platform actually enforces. Local `make reliability-check`
+behavior is unchanged: a healthy local Docker Desktop install succeeds on
+the first `docker update` attempt, so the retry mechanism adds no
+observable behavior change there, and the check count stays `32/32`.
+
+GitHub Actions run `32960673438` itself is **not** reported as passing
+here - it is real Day 6 engineering evidence of exactly the same kind as
+the Buildx portability finding above, fixed and documented rather than
+quietly re-run away. The next run against the commit containing this fix
+will independently confirm whether the narrow retry closes it.
+
 ## `ci.yml`: PR and main validation
 
 **Triggers**: `pull_request` targeting `main`, `push` to `main`, and

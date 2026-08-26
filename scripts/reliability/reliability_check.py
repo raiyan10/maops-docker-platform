@@ -477,28 +477,217 @@ def check_timeout_hierarchy_config(sc: ModuleType):
     )
 
 
-def with_memory_shrink_restored(sc: ModuleType, container: str, memory: str, memory_swap: str, action):
+# --- Day 6 GitHub finding (run 32960673438): bounded, monotonic, VERIFIED
+# retry for `docker update` resource mutations --------------------------
+#
+# GitHub run 32960673438 proved the docker-container Buildx portability fix
+# (docs/ci-cd.md) and then exercised the ENTIRE reliability harness
+# correctly through Scenario 1's real transient PID 1 OOM crash and full
+# automatic recovery - only to fail ~0.17s later, inside Scenario 2, on the
+# very first `docker update --memory 6m --memory-swap 6m` issued against the
+# just-restarted `state` container:
+#
+#   Error response from daemon: Cannot update container <id>:
+#   runc did not terminate successfully: exit status 1:
+#   openat2 /sys/fs/cgroup/system.slice/docker-<id>.scope/cgroup.controllers:
+#   no such file or directory
+#
+# This is not reproducible against this project's own local Docker Desktop
+# install - it is treated as a GitHub-hosted-runner/runc/cgroup v2
+# post-restart synchronization race until proven otherwise (a container that
+# was just automatically restarted by the restart-policy engine can, on some
+# Linux runner cgroup v2 hierarchies, have a brief window where runc's own
+# cgroup.controllers bookkeeping for the new cgroup instance is not yet
+# fully settled when a `docker update` lands). The remediation below makes
+# `docker update` resource mutations robust to EXACTLY this narrow class of
+# error - never to Docker errors in general - and every eventual "success"
+# is independently re-verified via `docker inspect`, never inferred from
+# exit code alone.
+
+RESOURCE_UPDATE_RETRY_DEADLINE_SECONDS = 10.0
+RESOURCE_UPDATE_RETRY_INTERVAL_SECONDS = 0.5
+
+_MEMORY_STRING_SUFFIXES = {"b": 1, "k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}
+
+
+def _docker_memory_string_to_bytes(value: str) -> int:
+    """Parses a `docker update --memory`/`--memory-swap` CLI value (a plain
+    byte count, optionally suffixed `b`/`k`/`m`/`g`, or `-1` for unlimited)
+    into the integer byte count `HostConfig.Memory`/`HostConfig.MemorySwap`
+    reports - so callers that only have the CLI string (e.g. `"6m"`) don't
+    have to separately compute the expected verification value by hand."""
+    text = value.strip()
+    suffix = text[-1].lower() if text else ""
+    if suffix in _MEMORY_STRING_SUFFIXES:
+        return int(text[:-1]) * _MEMORY_STRING_SUFFIXES[suffix]
+    return int(text)
+
+
+def _is_transient_cgroup_update_race(stderr: str) -> bool:
+    """Narrow classifier for the EXACT class of error GitHub run 32960673438
+    hit. Deliberately requires ALL THREE fragments together - a bare
+    "no such file or directory" is common to many unrelated, genuinely
+    non-retryable Docker/runc errors (a missing binary, a bad bind mount, a
+    typo'd path) and must never by itself be treated as retryable; nor
+    should "cgroup.controllers" or "runc did not terminate successfully"
+    alone. This intentionally does NOT match "permission denied", "invalid
+    memory limit", "invalid argument", "container not found", "Cannot
+    connect to the Docker daemon", or an unknown-flag/CLI-syntax error -
+    all of those fail immediately, exactly as a real, non-transient error
+    should."""
+    text = stderr or ""
+    return (
+        "runc did not terminate successfully" in text
+        and "cgroup.controllers" in text
+        and "no such file or directory" in text.lower()
+    )
+
+
+def _inspect_host_config(sc: ModuleType, container: str, context: str) -> dict:
+    result = sc.run_docker(["inspect", container, "--format", "{{json .HostConfig}}"])
+    if result.returncode != 0:
+        raise ReliabilityError(f"{context}: docker inspect {container} failed: {result.stderr.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReliabilityError(f"{context}: docker inspect {container} returned non-JSON output: {result.stdout!r}") from exc
+
+
+def update_container_resources_verified(
+    sc: ModuleType,
+    container: str,
+    memory: str,
+    memory_swap: str,
+    *,
+    expected_memory_bytes: int | None = None,
+    expected_memory_swap_bytes: int | None = None,
+    deadline_seconds: float = RESOURCE_UPDATE_RETRY_DEADLINE_SECONDS,
+    retry_interval_seconds: float = RESOURCE_UPDATE_RETRY_INTERVAL_SECONDS,
+    now=time.monotonic,
+    sleep=time.sleep,
+) -> dict:
+    """Issues `docker update --memory <memory> --memory-swap <memory_swap>
+    <container>` and returns only once the resulting `HostConfig.Memory`/
+    `HostConfig.MemorySwap` are independently re-inspected and confirmed to
+    hold the EXACT expected values - never inferring success from exit code
+    alone (`expected_memory_bytes`/`expected_memory_swap_bytes` default to
+    parsing `memory`/`memory_swap` themselves via
+    `_docker_memory_string_to_bytes`, but a caller restoring to a value it
+    already has as an int - e.g. the original `HostConfig.Memory` - should
+    pass the exact expected ints directly rather than round-tripping through
+    a string).
+
+    Retry semantics, bounded by a real `time.monotonic()`-measured deadline
+    (`now`/`sleep` are injectable for Docker-free unit testing - see
+    tests/test_reliability_check.py):
+
+    - `docker update` exits 0: the update's OWN `HostConfig` is inspected.
+      Exact match -> return immediately. A mismatch is NOT retried (a
+      "successful" update that produced the wrong values is a real
+      verification failure, not the narrow transient race this helper
+      exists for) - raises `ReliabilityError` immediately.
+    - `docker update` exits non-zero with the EXACT narrow transient
+      cgroup/runc race signature (`_is_transient_cgroup_update_race`):
+      `HostConfig` is inspected before any retry, in case the mutation
+      landed despite the non-zero exit (Docker/runc can genuinely return
+      non-zero after a partial operation) - an exact match here returns
+      immediately without reissuing `docker update`; a real mismatch
+      re-checks the bounded deadline and either sleeps and retries, or
+      raises `ReliabilityError` if the deadline has passed. A container
+      that disappears mid-retry (the verification `docker inspect` itself
+      fails) raises `ReliabilityError` immediately - it never keeps
+      retrying against a container that may no longer exist.
+    - `docker update` exits non-zero with ANY other error: raises
+      `ReliabilityError` immediately - no retry, no retry storm.
+    """
+    if expected_memory_bytes is None:
+        expected_memory_bytes = _docker_memory_string_to_bytes(memory)
+    if expected_memory_swap_bytes is None:
+        expected_memory_swap_bytes = _docker_memory_string_to_bytes(memory_swap)
+
+    def _verified(host_config: dict) -> bool:
+        return (
+            host_config.get("Memory") == expected_memory_bytes
+            and host_config.get("MemorySwap") == expected_memory_swap_bytes
+        )
+
+    action_desc = f"docker update {container} --memory {memory} --memory-swap {memory_swap}"
+    deadline = now() + deadline_seconds
+    attempt = 0
+
+    while True:
+        attempt += 1
+        update_result = sc.run_docker(["update", "--memory", memory, "--memory-swap", memory_swap, container])
+
+        if update_result.returncode == 0:
+            host_config = _inspect_host_config(sc, container, f"{action_desc}: post-update verification (attempt {attempt})")
+            if _verified(host_config):
+                return {"attempts": attempt, "memory": host_config.get("Memory"), "memory_swap": host_config.get("MemorySwap")}
+            raise ReliabilityError(
+                f"{action_desc} reported success but HostConfig did not verify (attempt {attempt}): "
+                f"Memory={host_config.get('Memory')!r} MemorySwap={host_config.get('MemorySwap')!r}, "
+                f"expected Memory={expected_memory_bytes!r} MemorySwap={expected_memory_swap_bytes!r}"
+            )
+
+        stderr = (update_result.stderr or "").strip()
+        if not _is_transient_cgroup_update_race(stderr):
+            raise ReliabilityError(f"{action_desc} failed (attempt {attempt}, non-retryable): {stderr}")
+
+        # Recognized narrow transient race: before retrying (or giving up),
+        # check whether the mutation actually landed despite the non-zero
+        # exit - avoids both a redundant blind retry and a false FAIL.
+        host_config = _inspect_host_config(
+            sc, container,
+            f"{action_desc}: transient cgroup/runc race retry check (attempt {attempt}): {stderr}",
+        )
+        if _verified(host_config):
+            return {
+                "attempts": attempt,
+                "memory": host_config.get("Memory"),
+                "memory_swap": host_config.get("MemorySwap"),
+                "note": "verified already applied despite non-zero docker update exit (transient cgroup/runc race)",
+            }
+
+        remaining = deadline - now()
+        if remaining <= 0:
+            raise ReliabilityError(
+                f"{action_desc} did not succeed and verify within the {deadline_seconds}s bounded retry "
+                f"deadline ({attempt} attempt(s)); last recognized transient error: {stderr}"
+            )
+        sleep(min(retry_interval_seconds, remaining))
+
+
+def with_memory_shrink_restored(
+    sc: ModuleType,
+    container: str,
+    memory: str,
+    memory_swap: str,
+    action,
+    *,
+    now=time.monotonic,
+    sleep=time.sleep,
+):
     """Shrinks `container`'s memory limit, captures its ORIGINAL values via a
     real `docker inspect`, invokes `action()`, and ALWAYS attempts to restore
-    the original `--memory`/`--memory-swap` afterward via `docker update` -
-    even if `action` raises. This is what SCENARIO 2's persistent-failure
-    proof (below) depends on: a real container must never be left
-    permanently resource-starved just because the assertion inside `action`
-    failed or a `docker` subprocess call itself raised.
+    the original `--memory`/`--memory-swap` afterward - even if `action`
+    raises. This is what SCENARIO 2's persistent-failure proof (below)
+    depends on: a real container must never be left permanently
+    resource-starved just because the assertion inside `action` failed or a
+    `docker` subprocess call itself raised.
 
-    Day 6 (closes Day 5 finding M-A, day-05-resource-restart-review.md):
-    restoration is a first-class VERIFIED invariant, not a warning-only
-    best-effort. After the restore `docker update` call, this re-inspects
-    the container's real `HostConfig.Memory`/`MemorySwap` and compares
-    against the captured original values. A failed restore *command*, or a
-    restore command that reports success but the container's inspected
-    values don't actually match the original ones, both raise
-    `ReliabilityError` - never merely a `stderr` warning - so
-    `reliability-check` FAILS rather than silently reporting PASS while a
-    container stays incorrectly constrained.
+    Day 6 (closes Day 5 finding M-A, day-05-resource-restart-review.md, and
+    the real GitHub run 32960673438 cgroup/runc finding above): BOTH the
+    shrink and the restore now go through `update_container_resources_
+    verified()` - a bounded, monotonic, independently-re-inspected retry,
+    narrowly scoped to the exact transient cgroup/runc race GitHub's runner
+    hit. Restoration remains a first-class VERIFIED invariant, never a
+    warning-only best-effort: if it cannot be applied AND verified inside
+    the bounded retry deadline, `update_container_resources_verified` raises
+    `ReliabilityError` - `reliability-check` FAILS rather than silently
+    reporting PASS while a container stays incorrectly constrained.
 
-    Precedence when BOTH the wrapped action raised AND the restore failed/
-    was not verified: the restore failure is raised (a permanently
+    Precedence when BOTH the wrapped action raised AND the restore ulimately
+    failed/was not verified: the restore failure is raised (a permanently
     misconfigured container is the more urgent operational fact), with the
     action's own exception attached as its `__cause__` (`raise ... from
     action_exc`) so neither failure's diagnostics are lost - `str()` on the
@@ -506,22 +695,29 @@ def with_memory_shrink_restored(sc: ModuleType, container: str, memory: str, mem
     traceback remains visible via Python's own exception-chaining
     ("The above exception was the direct cause of the following
     exception:"). If the restore succeeds and verifies but the action
-    raised, the action's own exception is re-raised unchanged (matching the
-    pre-Day-6 behavior). No exception is ever swallowed.
+    raised, the action's own exception is re-raised unchanged. No exception
+    is ever swallowed.
 
     A pure, Docker-mockable unit of the shape this project's other reusable
     check functions already take (`sc` first, real Docker calls only
     through `sc.docker_json`/`sc.run_docker`) - see
     tests/test_reliability_check.py for the injected-failure cleanup proof.
+    `now`/`sleep` default to real `time.monotonic`/`time.sleep` (production
+    behavior, unchanged) and are forwarded verbatim to both the shrink and
+    restore calls into `update_container_resources_verified` - overridable
+    purely so tests can exercise a bounded multi-retry sequence without any
+    real fixed-time delay.
     """
     host_config = sc.docker_json(["inspect", container, "--format", "{{json .HostConfig}}"])
     original_memory = host_config.get("Memory")
     original_memory_swap = host_config.get("MemorySwap")
 
-    shrink_result = sc.run_docker(["update", "--memory", memory, "--memory-swap", memory_swap, container])
-    if shrink_result.returncode != 0:
-        raise ReliabilityError(f"docker update (shrink memory) {container} failed: {shrink_result.stderr.strip()}")
-    print(f"reliability_check: shrank {container}'s memory limit to {memory} - the kernel will OOM-kill under this persistent condition")
+    shrink_info = update_container_resources_verified(sc, container, memory, memory_swap, now=now, sleep=sleep)
+    print(
+        f"reliability_check: shrank AND VERIFIED {container}'s memory limit to {memory} "
+        f"(HostConfig Memory={shrink_info['memory']} MemorySwap={shrink_info['memory_swap']}, "
+        f"{shrink_info['attempts']} attempt(s)) - the kernel will OOM-kill under this persistent condition"
+    )
 
     action_exc: BaseException | None = None
     action_result = None
@@ -530,36 +726,22 @@ def with_memory_shrink_restored(sc: ModuleType, container: str, memory: str, mem
     except BaseException as exc:  # noqa: BLE001 - re-raised (or chained) below, never swallowed
         action_exc = exc
 
-    restore_result = sc.run_docker(
-        ["update", "--memory", str(original_memory), "--memory-swap", str(original_memory_swap), container]
-    )
-    restore_command_failed = restore_result.returncode != 0
-    restore_verified = False
-    verify_detail = "restore command failed - no verification attempted"
-
-    if not restore_command_failed:
-        verify_host_config = sc.docker_json(["inspect", container, "--format", "{{json .HostConfig}}"])
-        actual_memory = verify_host_config.get("Memory")
-        actual_memory_swap = verify_host_config.get("MemorySwap")
-        restore_verified = actual_memory == original_memory and actual_memory_swap == original_memory_swap
-        verify_detail = (
-            f"post-restore HostConfig Memory={actual_memory!r} MemorySwap={actual_memory_swap!r} "
-            f"(expected {original_memory!r}/{original_memory_swap!r})"
+    try:
+        restore_info = update_container_resources_verified(
+            sc, container, str(original_memory), str(original_memory_swap),
+            expected_memory_bytes=original_memory,
+            expected_memory_swap_bytes=original_memory_swap,
+            now=now, sleep=sleep,
         )
-
-    if restore_command_failed or not restore_verified:
-        restore_error = ReliabilityError(
-            f"memory restore for {container} to {original_memory}/{original_memory_swap} FAILED "
-            f"(command_failed={restore_command_failed}, verified={restore_verified}): "
-            f"{restore_result.stderr.strip() if restore_command_failed else verify_detail}"
-        )
+    except ReliabilityError as restore_exc:
         if action_exc is not None:
-            raise restore_error from action_exc
-        raise restore_error
+            raise restore_exc from action_exc
+        raise
 
     print(
-        f"reliability_check: restored AND VERIFIED {container}'s memory limit to "
-        f"{original_memory} bytes ({verify_detail})"
+        f"reliability_check: restored AND VERIFIED {container}'s memory limit to {original_memory} bytes "
+        f"(HostConfig Memory={restore_info['memory']} MemorySwap={restore_info['memory_swap']}, "
+        f"{restore_info['attempts']} attempt(s))"
     )
 
     if action_exc is not None:
