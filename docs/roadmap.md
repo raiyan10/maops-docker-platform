@@ -365,6 +365,16 @@ runtime plane — see `docs/ci-cd.md` for the full design.
   no Cosign/SLSA/provenance attestation, no Kubernetes/Helm/Argo CD, no
   Prometheus/Grafana/OpenTelemetry, no Terraform/Ansible - all explicitly
   Day 7+ scope or out of this project's scope entirely (see below).
+- **Emergency Debian-security overlay** (in-scope hotfix, not a new
+  day): `make release-check`'s unweakened vulnerability policy caught a
+  real, fixable HIGH finding (CVE-2026-14456, `libssl3t64`) after the
+  pinned Distroless digest lagged an already-published Debian Security
+  fix. Remediated with a narrow, checksum-pinned Debian-security package
+  overlay (a new `security-patch` build stage in `docker/app/Dockerfile`,
+  pinned via `security/runtime-patches.lock`) rather than a base-image
+  migration or a policy weakening - see `docs/build-security.md` and
+  `docs/supply-chain.md`. The Distroless base digest and the runtime
+  topology above are both unchanged.
 
 ## Day 7 — Hardening, reviews, showcase -> v1.0.0 (planned)
 

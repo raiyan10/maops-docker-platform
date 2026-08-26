@@ -29,8 +29,13 @@ exactly the `publish` job; every `uses:` reference is pinned to a full
 40-character commit SHA; no `continue-on-error: true`; no `|| true` used to
 disguise a gate; both files declare their required triggers; `release.yml`
 declares the `v*.*.*` tag pattern; the `publish` job's `if:` can only ever
-be satisfied by a real tag push, never `workflow_dispatch`; no registry-
-publication command appears; no Day 7+ tooling reference appears.
+be satisfied by a real tag push, never `workflow_dispatch`; every job that
+runs `make release-check` first creates and selects a job-scoped
+`docker-container` driver Buildx builder (the GitHub-hosted runner's
+default `docker` driver cannot satisfy this project's Day 4 deterministic
+`type=docker,dest=...` exporter - see docs/ci-cd.md) and removes it with
+`if: always()`; no registry-publication command appears; no Day 7+
+tooling reference appears.
 """
 
 from __future__ import annotations
@@ -143,6 +148,29 @@ def nested_block(block_lines: list[str], key: str) -> list[str]:
         if stripped == f"{key}:" or stripped.startswith(f"{key}:"):
             return _extract_block(block_lines, i, key_indent=_line_indent(line))
     return []
+
+
+def list_items(block_lines: list[str]) -> list[list[str]]:
+    """Splits a YAML list block (e.g. a `steps:` block) into per-item line
+    groups. Each item starts at a `- ` marker at the list's own (shallowest
+    seen) indent and includes its own more-deeply-indented continuation
+    lines - generic the same way `top_level_block`/`job_block`/
+    `nested_block` above are, not specific to steps."""
+    items: list[list[str]] = []
+    item_indent: int | None = None
+    for line in block_lines:
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            if items:
+                items[-1].append(line)
+            continue
+        indent = _line_indent(line)
+        if stripped.startswith("- ") and (item_indent is None or indent == item_indent):
+            item_indent = indent
+            items.append([line])
+        elif items:
+            items[-1].append(line)
+    return items
 
 
 def _non_comment_values(block_lines: list[str]) -> list[str]:
@@ -355,6 +383,81 @@ def check_required_triggers(texts: dict[str, str]) -> list[Finding]:
     return findings
 
 
+JOBS_REQUIRING_BUILDX_CONTAINER_BUILDER = (
+    ("ci.yml", "release-policy"),
+    ("release.yml", "validate"),
+)
+
+
+def check_buildx_container_builder_before_release_check(texts: dict[str, str]) -> list[Finding]:
+    """Any job that reaches `make build`/`make release-check` uses this
+    project's Day 4 deterministic `type=docker,dest=...` Buildx archive
+    exporter (see Makefile's `build` target). GitHub's hosted runner Docker
+    Engine does not run the containerd image store, so the Buildx default
+    `docker` driver builder cannot satisfy that exporter ("Docker exporter
+    is not supported for the docker driver" - see docs/ci-cd.md). Each such
+    job must therefore create (and select, via `--use`) a job-scoped
+    `docker-container` driver builder before `make release-check`, and
+    remove it afterward with `if: always()` so cleanup still runs after a
+    failed gate. Checked by step order within the job block (via
+    `list_items`), not a full YAML/step-graph model."""
+    findings: list[Finding] = []
+    for file_name, job_name in JOBS_REQUIRING_BUILDX_CONTAINER_BUILDER:
+        text = texts.get(file_name)
+        if text is None:
+            continue
+        block = job_block(text, job_name)
+        if not block:
+            findings.append(Finding(f"{file_name}: no '{job_name}' job found to verify Buildx builder setup"))
+            continue
+
+        steps = list_items(nested_block(block, "steps"))
+        step_texts = ["\n".join(step) for step in steps]
+
+        release_check_idx = next((i for i, s in enumerate(step_texts) if "make release-check" in s), None)
+        if release_check_idx is None:
+            findings.append(Finding(f"{file_name}: '{job_name}' job does not run 'make release-check'"))
+            continue
+
+        builder_create_idx = next(
+            (
+                i
+                for i, s in enumerate(step_texts)
+                if "docker buildx create" in s and "docker-container" in s and "--use" in s
+            ),
+            None,
+        )
+        if builder_create_idx is None:
+            findings.append(
+                Finding(
+                    f"{file_name}: '{job_name}' job must create a 'docker-container' driver Buildx "
+                    "builder (with --use) before 'make release-check' - the runner's default docker "
+                    "driver cannot satisfy the project's type=docker,dest=... exporter"
+                )
+            )
+        elif builder_create_idx >= release_check_idx:
+            findings.append(
+                Finding(
+                    f"{file_name}: '{job_name}' job's Buildx builder-creation step must run before "
+                    "'make release-check', not after"
+                )
+            )
+
+        cleanup_idx = next((i for i, s in enumerate(step_texts) if "buildx rm" in s), None)
+        if cleanup_idx is None:
+            findings.append(
+                Finding(f"{file_name}: '{job_name}' job must remove its job-scoped Buildx builder after use")
+            )
+        elif "if: always()" not in step_texts[cleanup_idx]:
+            findings.append(
+                Finding(
+                    f"{file_name}: '{job_name}' job's Buildx builder cleanup step must run with "
+                    "'if: always()' so it still runs after a failed release-check"
+                )
+            )
+    return findings
+
+
 def check_no_registry_publication(texts: dict[str, str]) -> list[Finding]:
     findings = []
     for name, text in texts.items():
@@ -384,6 +487,7 @@ CHECKS = [
     check_release_permissions_scoped,
     check_manual_dispatch_cannot_publish,
     check_required_triggers,
+    check_buildx_container_builder_before_release_check,
     check_no_registry_publication,
     check_no_day7_plus_tooling,
 ]

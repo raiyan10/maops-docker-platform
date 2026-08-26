@@ -52,6 +52,110 @@ workflow would save perhaps five lines while adding a third file's worth of
 indirection to reason about. Two workflows, each readable start to finish,
 was judged clearer.
 
+## GitHub-hosted runner Buildx portability (real CI finding)
+
+This project's first real GitHub Actions run of this branch's `ci.yml`
+(run ID `32938805880`) is not reported as successful here — it genuinely
+failed, and the failure is real Day 6 engineering evidence, not a mistake
+to be quietly fixed and forgotten.
+`quality` passed (529 unit tests, lint, `dockerfile-check` 10/10,
+`compose-check` 17/17, `workflow-check` 11/11). `release-policy` failed
+inside `make build`, before any image-level gate (image-audit, smoke,
+security-check, ...) ever ran:
+
+```
+docker buildx build --no-cache \
+  --build-arg VERSION=0.6.0 \
+  --build-arg SOURCE_DATE_EPOCH=... \
+  --output type=docker,rewrite-timestamp=true,...,dest=...tar \
+  -f docker/app/Dockerfile .
+
+ERROR: Docker exporter is not supported for the docker driver.
+Switch to a different driver, or turn on the containerd image store.
+```
+
+**Root cause**: `make build` (see `Makefile`) uses BuildKit's
+`--output type=docker,rewrite-timestamp=true,...,dest=<tar>` exporter — the
+Day 4 deterministic-build archive-export flow (`docs/build-security.md`).
+That exporter requires either a `docker-container` driver Buildx builder,
+or a `docker` driver builder backed by the containerd image store. GitHub's
+`ubuntu-latest` runner (Docker Engine 28.0.4, confirmed via this run's own
+`docker buildx ls`) ships Buildx's default `docker` driver builder without
+the containerd image store — so that exporter is structurally unavailable
+there, independent of anything this repository controls.
+
+**Why local Docker never exposed this**: a local Docker Desktop
+installation's default `docker` driver builder already runs the containerd
+image store (`docker info`'s `driver-type io.containerd.snapshotter.v1`),
+so the identical `make build` command succeeds locally today. This is a
+genuine environment difference between a developer's Docker Desktop and a
+clean GitHub-hosted Ubuntu runner — not a bug either environment can be
+said to have "gotten wrong" — and it could only ever be caught by a real
+run on the real target environment, which is exactly what Day 6's
+GitHub Actions integration is for.
+
+**Remediation — CI environment preparation, not an application-image
+design change**: both `ci.yml`'s `release-policy` job and `release.yml`'s
+`validate` job — the only two jobs that reach `make build`/`make
+release-check` — now create and select (`--use`) a job-scoped Buildx
+builder using the `docker-container` driver immediately before `make
+release-check`, using the Docker CLI already present on the runner (no new
+GitHub Action introduced):
+
+```yaml
+- name: Create job-scoped Buildx builder (docker-container driver)
+  run: |
+    BUILDER_NAME="maops-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+    echo "BUILDER_NAME=${BUILDER_NAME}" >> "$GITHUB_ENV"
+    docker buildx create --driver docker-container --name "${BUILDER_NAME}" --use
+    docker buildx inspect "${BUILDER_NAME}" --bootstrap
+```
+
+followed, after `make release-check`, by an `if: always()` cleanup step
+that removes only that run's own builder (never a prune, never another
+job's builder), checking existence first rather than swallowing the error
+with `|| true`:
+
+```yaml
+- name: Remove job-scoped Buildx builder
+  if: always()
+  run: |
+    if docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
+      docker buildx rm "${BUILDER_NAME}"
+    else
+      echo "builder ${BUILDER_NAME} not found - nothing to remove"
+    fi
+```
+
+The builder's name is derived only from `GITHUB_RUN_ID`/`GITHUB_RUN_ATTEMPT`
+(GitHub-controlled run identifiers), never from PR/tag/title text, matching
+this repository's existing project-prefixed-unique-name discipline for
+every other disposable Docker resource it creates
+(`.claude/CLAUDE.md`'s Docker safety constraints). A `docker buildx
+version`/`docker buildx ls` diagnostic step runs before builder creation
+so a CI log makes the environment difference (`driver=docker` locally vs.
+the newly created `driver=docker-container` builder in CI) visible.
+
+**What this explicitly is not**: no Dockerfile change, no weakening of
+`--no-cache`, `SOURCE_DATE_EPOCH`, `rewrite-timestamp=true`, or the
+`type=docker` archive-export/`docker load` flow, no CI-only "weaker build
+path," and no `continue-on-error`/`|| true` around the gate. The Makefile
+itself is unchanged — `docker buildx build` always targets whichever
+Buildx builder is currently selected, so creating and selecting a
+`docker-container` builder before invoking the existing, unmodified `make
+build`/`make release-check` is purely CI environment preparation, not a
+change to what is being built or how its reproducibility is proven. The
+Day 4 deterministic-build contract (`docs/build-security.md`) and its
+two-independent-builds byte-identity proof (`reproducibility-check`) are
+unchanged by this fix.
+
+`scripts/ci/check_workflows.py`'s
+`check_buildx_container_builder_before_release_check()` statically enforces
+that both `ci.yml`'s `release-policy` job and `release.yml`'s `validate`
+job create a `docker-container` driver builder (with `--use`) before `make
+release-check`, and remove it with `if: always()` afterward — see
+"`workflow-check`: self-validating, deterministically" below.
+
 ## `ci.yml`: PR and main validation
 
 **Triggers**: `pull_request` targeting `main`, `push` to `main`, and
@@ -266,8 +370,11 @@ validator; see its own module docstring for the exact policy list it
 enforces (files exist; no `pull_request_target`; `ci.yml`'s permissions;
 `release.yml`'s permission scoping; SHA pinning; no `continue-on-error:
 true`; no `|| true` around a gate; required triggers; the `v*.*.*` tag
-pattern; the manual-dispatch-cannot-publish shape; no registry-publication
-command; no Day 7+ tooling reference).
+pattern; the manual-dispatch-cannot-publish shape; every job reaching
+`make release-check` creates and selects a `docker-container` driver
+Buildx builder beforehand and removes it with `if: always()` afterward
+(see "GitHub-hosted runner Buildx portability" above); no
+registry-publication command; no Day 7+ tooling reference).
 
 **Self-reference, handled deliberately**: `ci.yml`'s own `quality` job runs
 this exact script against its own checked-out copy of `ci.yml` and
@@ -311,6 +418,20 @@ absences as a repository policy, not merely a convention. A required
 validation failure produces a non-zero job result, which GitHub Actions
 surfaces as a failed check on the PR/commit — nothing in either workflow
 can turn a failed gate into a green one.
+
+### Real example: a blocking finding fixed, not the gate weakened
+
+This is not a hypothetical property. On 2026-08-26, `make release-check`'s
+`supply-chain-check` stage genuinely failed locally against an unchanged
+policy (`CRITICAL=0`, `HIGH-with-fix=1`: CVE-2026-14456 in `libssl3t64`,
+already fixed upstream by Debian Security but not yet by the day's pinned
+Distroless digest). The fix was an emergency, checksum-pinned
+Debian-security package overlay in `docker/app/Dockerfile` (see
+`docs/build-security.md` and `docs/supply-chain.md`) — `scripts/security/
+check_trivy_report.py`'s policy itself was never touched. The same
+gate — local or in CI — would have failed the release either way; this is
+exactly the "fail closed" property this document describes, exercised for
+real rather than only by synthetic fixtures.
 
 ## How to run the equivalent checks locally
 

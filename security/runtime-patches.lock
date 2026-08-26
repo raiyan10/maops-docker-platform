@@ -1,0 +1,50 @@
+# Emergency Debian-security runtime package overlays for
+# maops-docker-platform (Day 6). See docs/build-security.md and
+# docs/supply-chain.md for the full rationale.
+#
+# This file exists because gcr.io/distroless/python3-debian13:nonroot at
+# the digest pinned in docker/app/Dockerfile temporarily lags an
+# already-published Debian Security fix. Rather than weaken the
+# project's vulnerability policy (scripts/security/check_trivy_report.py)
+# or wait on an upstream Distroless rebuild with no ETA, a single, narrow,
+# fully-pinned Debian-security package is overlaid onto the final runtime
+# in a dedicated build stage (see the `security-patch` stage in
+# docker/app/Dockerfile). The underlying Distroless base digest stays
+# pinned and unchanged - this is an overlay, not a base-image migration.
+#
+# KEY=value, shell-sourceable and Python-parseable
+# (scripts/security/runtime_patch_lock.py, scripts/lint/check_dockerfile.py,
+# scripts/build/image_audit.py). Every value below was verified against
+# Debian's own signed archive metadata before being written here - see
+# docs/supply-chain.md for the exact verification performed (SHA256
+# cross-checked against the debian-security `trixie-security` `Packages`
+# index at the same snapshot timestamp, not merely computed from the
+# downloaded file in isolation).
+
+# CVE-2026-14456: OpenSSL QUIC listener memory-exhaustion issue. Debian
+# Security tracker (security-tracker.debian.org/tracker/CVE-2026-14456)
+# confirms trixie is vulnerable at 3.5.6-1~deb13u2 and fixed in
+# trixie-security at 3.5.7-1~deb13u2, published 2026-08-25. The
+# Distroless digest pinned in docker/app/Dockerfile still ships the
+# vulnerable 3.5.6-1~deb13u2 build as of this writing.
+LIBSSL_CVE=CVE-2026-14456
+LIBSSL_PACKAGE=libssl3t64
+LIBSSL_SOURCE_PACKAGE=openssl
+LIBSSL_VULNERABLE_VERSION=3.5.6-1~deb13u2
+LIBSSL_VERSION=3.5.7-1~deb13u2
+LIBSSL_ARCH=amd64
+LIBSSL_SUITE=trixie-security
+LIBSSL_ARCHIVE=debian-security
+LIBSSL_SNAPSHOT_TIMESTAMP=20260825T185058Z
+LIBSSL_URL=https://snapshot.debian.org/archive/debian-security/20260825T185058Z/pool/updates/main/o/openssl/libssl3t64_3.5.7-1~deb13u2_amd64.deb
+LIBSSL_DEB_SHA256=916f7f40b34a06e6ebfaefcdab331bff458328411da672598f126a760472467d
+LIBSSL_DEB_SIZE_BYTES=2453872
+
+# Exact content hashes of the runtime files this overlay copies into the
+# final Distroless stage (docker/app/Dockerfile), extracted from the
+# verified .deb above. scripts/build/image_audit.py compares these
+# against the corresponding files inside the built image at audit time -
+# proving the real fixed payload is present without re-downloading
+# anything.
+LIBSSL_SO_SHA256=4b34859318555bf96d518131bed5fc4d5e35fefa4e1729f49eaa26bd05263850
+LIBCRYPTO_SO_SHA256=8bb5f3fdffe280d4453eb79a4663c2c47af70b7c247fe2e94e2da703cee1fd3d

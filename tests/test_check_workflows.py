@@ -130,6 +130,157 @@ class BlockExtractionTests(unittest.TestCase):
         self.assertEqual([l.strip() for l in perms], ["contents: read"])
 
 
+GOOD_CI_RELEASE_POLICY = """\
+name: CI
+permissions:
+  contents: read
+jobs:
+  release-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create job-scoped Buildx builder (docker-container driver)
+        run: |
+          docker buildx create --driver docker-container --name maops-ci-1-1 --use
+          docker buildx inspect maops-ci-1-1 --bootstrap
+      - name: make release-check
+        run: make release-check
+      - name: Remove job-scoped Buildx builder
+        if: always()
+        run: |
+          docker buildx rm maops-ci-1-1
+"""
+
+GOOD_RELEASE_VALIDATE = """\
+name: Release
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create job-scoped Buildx builder (docker-container driver)
+        run: |
+          docker buildx create --driver docker-container --name maops-ci-1-1 --use
+          docker buildx inspect maops-ci-1-1 --bootstrap
+      - name: make release-check
+        run: make release-check
+      - name: Remove job-scoped Buildx builder
+        if: always()
+        run: |
+          docker buildx rm maops-ci-1-1
+"""
+
+
+class ListItemsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = load_check_workflows()
+
+    def test_splits_top_level_list_items(self) -> None:
+        block = ["- name: a", "  run: x", "- name: b", "  run: y"]
+        items = self.module.list_items(block)
+        self.assertEqual(len(items), 2)
+        self.assertIn("name: a", items[0][0])
+        self.assertIn("name: b", items[1][0])
+
+    def test_continuation_lines_stay_with_their_item(self) -> None:
+        block = ["- name: a", "  run: |", "    line1", "    line2", "- name: b", "  run: z"]
+        items = self.module.list_items(block)
+        self.assertEqual(len(items), 2)
+        self.assertIn("line1", "\n".join(items[0]))
+        self.assertIn("line2", "\n".join(items[0]))
+
+    def test_empty_block_returns_no_items(self) -> None:
+        self.assertEqual(self.module.list_items([]), [])
+
+
+class BuildxContainerBuilderBeforeReleaseCheckTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = load_check_workflows()
+
+    def test_good_ci_release_policy_passes(self) -> None:
+        self.assertEqual(
+            self.module.check_buildx_container_builder_before_release_check({"ci.yml": GOOD_CI_RELEASE_POLICY}), []
+        )
+
+    def test_good_release_validate_passes(self) -> None:
+        self.assertEqual(
+            self.module.check_buildx_container_builder_before_release_check(
+                {"release.yml": GOOD_RELEASE_VALIDATE}
+            ),
+            [],
+        )
+
+    def test_missing_release_policy_job_is_rejected(self) -> None:
+        text = "jobs:\n  quality:\n    steps:\n      - run: make quality\n"
+        findings = self.module.check_buildx_container_builder_before_release_check({"ci.yml": text})
+        self.assertTrue(findings)
+
+    def test_missing_release_check_step_is_rejected(self) -> None:
+        bad = GOOD_CI_RELEASE_POLICY.replace(
+            "      - name: make release-check\n        run: make release-check\n", ""
+        )
+        findings = self.module.check_buildx_container_builder_before_release_check({"ci.yml": bad})
+        self.assertTrue(findings)
+
+    def test_missing_builder_creation_is_rejected(self) -> None:
+        bad = GOOD_CI_RELEASE_POLICY.replace(
+            "      - name: Create job-scoped Buildx builder (docker-container driver)\n"
+            "        run: |\n"
+            "          docker buildx create --driver docker-container --name maops-ci-1-1 --use\n"
+            "          docker buildx inspect maops-ci-1-1 --bootstrap\n",
+            "",
+        )
+        findings = self.module.check_buildx_container_builder_before_release_check({"ci.yml": bad})
+        self.assertTrue(any("must create a 'docker-container'" in str(f) for f in findings))
+
+    def test_builder_creation_missing_use_flag_is_rejected(self) -> None:
+        bad = GOOD_CI_RELEASE_POLICY.replace(
+            "docker buildx create --driver docker-container --name maops-ci-1-1 --use",
+            "docker buildx create --driver docker-container --name maops-ci-1-1",
+        )
+        findings = self.module.check_buildx_container_builder_before_release_check({"ci.yml": bad})
+        self.assertTrue(any("must create a 'docker-container'" in str(f) for f in findings))
+
+    def test_builder_creation_after_release_check_is_rejected(self) -> None:
+        create_step = (
+            "      - name: Create job-scoped Buildx builder (docker-container driver)\n"
+            "        run: |\n"
+            "          docker buildx create --driver docker-container --name maops-ci-1-1 --use\n"
+            "          docker buildx inspect maops-ci-1-1 --bootstrap\n"
+        )
+        release_check_step = "      - name: make release-check\n        run: make release-check\n"
+        bad = GOOD_CI_RELEASE_POLICY.replace(create_step, "").replace(
+            release_check_step, release_check_step + create_step
+        )
+        findings = self.module.check_buildx_container_builder_before_release_check({"ci.yml": bad})
+        self.assertTrue(any("must run before" in str(f) for f in findings))
+
+    def test_missing_cleanup_step_is_rejected(self) -> None:
+        bad = GOOD_CI_RELEASE_POLICY.replace(
+            "      - name: Remove job-scoped Buildx builder\n"
+            "        if: always()\n"
+            "        run: |\n"
+            "          docker buildx rm maops-ci-1-1\n",
+            "",
+        )
+        findings = self.module.check_buildx_container_builder_before_release_check({"ci.yml": bad})
+        self.assertTrue(any("must remove its job-scoped Buildx builder" in str(f) for f in findings))
+
+    def test_cleanup_step_missing_always_is_rejected(self) -> None:
+        bad = GOOD_CI_RELEASE_POLICY.replace(
+            "      - name: Remove job-scoped Buildx builder\n        if: always()\n",
+            "      - name: Remove job-scoped Buildx builder\n",
+        )
+        findings = self.module.check_buildx_container_builder_before_release_check({"ci.yml": bad})
+        self.assertTrue(any("if: always()" in str(f) for f in findings))
+
+
 class RequiredFilesExistTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_check_workflows()

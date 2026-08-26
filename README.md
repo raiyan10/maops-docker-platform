@@ -42,6 +42,15 @@ is the container layer, not application logic.
   [docs/releases/v0.6.0.md](docs/releases/v0.6.0.md).
 - Runtime architecture unchanged: still exactly `gateway -> app -> state`,
   three services, two networks, one named volume, one application image.
+- **Emergency Debian-security overlay**: `make release-check`'s
+  unweakened vulnerability policy caught a real, fixable HIGH finding
+  (CVE-2026-14456, `libssl3t64`) that the pinned Distroless digest had not
+  yet picked up upstream. A checksum-pinned, official Debian Security
+  package overlay (a new `security-patch` build stage) fixes it without
+  migrating the runtime base or weakening the policy — see
+  [docs/build-security.md](docs/build-security.md) and
+  [docs/supply-chain.md](docs/supply-chain.md), and
+  `security/runtime-patches.lock` for the exact pin.
 
 ## Day 5 additions (health, reliability, resource controls)
 
@@ -91,10 +100,11 @@ is the container layer, not application logic.
   findings); Distroless was adopted after real vulnerability scanning,
   runtime testing, and reproducibility re-verification all passed against
   it. See [docs/build-security.md](docs/build-security.md).
-- **Two-stage build**: a digest-pinned `python:3.13-slim` builder stage
-  (filesystem preparation only) feeding the digest-pinned Distroless
-  final stage — the builder's own toolchain never enters the release
-  image.
+- **Two-stage build** (a third, build-time-only `security-patch` stage
+  was added Day 6 — see below): a digest-pinned `python:3.13-slim`
+  builder stage (filesystem preparation only) feeding the digest-pinned
+  Distroless final stage — the builder's own toolchain never enters the
+  release image.
 - A deterministic BuildKit/buildx release build (`make build`) — two
   independent, clean builds from the identical source tree produce a
   **byte-identical image ID**, proven by `make reproducibility-check`
@@ -263,7 +273,8 @@ gateway/                 # stdlib-only Python gateway (Day 2, sole host-facing s
 state/                   # stdlib-only Python persistence service (Day 3)
 config/platform.json     # non-secret, Compose-mounted runtime configuration (Day 3, timeout fields updated Day 5)
 security/scanners.lock   # digest-pinned Syft/Trivy scanner references (Day 4)
-docker/app/Dockerfile    # two-stage: slim builder -> Distroless final runtime, non-root, all three roles
+security/runtime-patches.lock  # checksum-pinned emergency Debian-security package overlay (Day 6)
+docker/app/Dockerfile    # 3-stage: slim builder -> security-patch overlay -> Distroless final runtime, non-root, all three roles
 compose.yaml             # three-service hardened Compose stack (state -> app -> gateway, resource/restart-bounded, Day 5)
 .github/workflows/       # CI + release delivery plane (Day 6) - see docs/ci-cd.md
 tests/                   # unittest suite (app/ + gateway/ + state/ + Day 4/5/6 tooling)

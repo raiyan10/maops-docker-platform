@@ -16,12 +16,25 @@ shell, no package manager). This checker validates BOTH stages, not just
 the final `FROM` - a prior single-stage assumption (only ever looking at
 the last `FROM`) would silently stop validating the builder pin entirely.
 
+Day 6: a third `security-patch` stage was inserted between `builder` and
+the final stage - a build-time-only Debian-security package overlay (see
+docker/app/Dockerfile's own comments and security/runtime-patches.lock)
+closing a real, currently-blocking vulnerability-policy finding
+(CVE-2026-14456) without migrating the runtime base image or weakening
+the vulnerability policy. This checker now validates all three stages,
+including cross-checking the patch stage's `ADD --checksum=` instruction
+against security/runtime-patches.lock's pinned URL/SHA256 (the single
+source of truth also used by scripts/build/image_audit.py), and that the
+verified payload is actually copied into the final stage.
+
 Checks:
-  * There are exactly two `FROM` instructions: a `python:*-slim` builder,
-    digest-pinned (`image:tag@sha256:<64 hex chars>`, validated as an
-    actual well-formed sha256 digest, never `:latest`), and a Distroless
-    `gcr.io/distroless/python3-debian13:nonroot` final runtime,
-    digest-pinned to this project's approved index digest.
+  * There are exactly three `FROM` instructions: a `python:*-slim`
+    builder, digest-pinned (`image:tag@sha256:<64 hex chars>`, validated
+    as an actual well-formed sha256 digest, never `:latest`), a
+    `security-patch` stage reusing that exact same digest-pinned
+    `python:*-slim` image (no new base image introduced), and a
+    Distroless `gcr.io/distroless/python3-debian13:nonroot` final
+    runtime, digest-pinned to this project's approved index digest.
   * The final USER is non-root and matches the expected 10001:10001
     intent.
   * A HEALTHCHECK instruction exists, is not `NONE`, and its CMD is
@@ -32,25 +45,41 @@ Checks:
     Dockerfile never relies on) fails this check rather than only failing
     at Compose-health-status time.
   * No `sudo` anywhere.
-  * No remote `ADD` (a URL as the source).
+  * No unverified remote `ADD` (a URL as the source): the ONE exception is
+    the `security-patch` stage's own checksum-pinned Debian-security
+    package fetch, which must live in that stage, use
+    `--checksum=sha256:<64 hex>`, and match security/runtime-patches.lock's
+    `LIBSSL_URL`/`LIBSSL_DEB_SHA256` exactly - any other remote `ADD`
+    (wrong stage, no checksum, or a checksum/URL that doesn't match the
+    lock file) still fails this check.
+  * The verified security-patch payload is actually copied into the final
+    stage (`COPY --from=security-patch` for the patched shared libraries
+    and the dpkg status.d metadata) - a patch stage that fetches and
+    verifies the package but never copies it anywhere would silently do
+    nothing.
   * No obviously secret-bearing ARG/ENV variable names.
   * An explicit WORKDIR is set (final stage).
   * The runtime command (ENTRYPOINT, or CMD if no ENTRYPOINT) uses exec
     form (a JSON array), never shell form, and ENTRYPOINT is the absolute
     `/usr/bin/python3.13` interpreter.
   * No `--privileged`/`setuid`/`setcap` usage.
-  * No `RUN` instruction in the final (post-builder) stage - the
-    Distroless runtime has no shell/coreutils to run one against, so any
-    `RUN` after the final `FROM` is either a mistake or silently
-    unreachable.
+  * No `RUN` instruction in the final (last) stage - the Distroless
+    runtime has no shell/coreutils to run one against, so any `RUN` there
+    is either a mistake or silently unreachable. `RUN` is permitted in
+    both the `builder` and `security-patch` stages (neither ships in the
+    final image).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
+from types import ModuleType
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 SECRET_NAME_PATTERN = re.compile(
     r"(PASSWORD|SECRET|TOKEN|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIAL)",
@@ -171,39 +200,48 @@ def _check_digest_pinned_from(
     return findings
 
 
+def _check_stage_name(line_no: int, rest: str, expected_name: str, stage_label: str) -> list[Finding]:
+    tokens = rest.split()
+    if len(tokens) < 3 or tokens[1].upper() != "AS":
+        return [Finding(line_no, f"{stage_label} FROM must declare 'AS {expected_name}': {rest!r}")]
+    if tokens[2].lower() != expected_name:
+        return [Finding(line_no, f"{stage_label} stage name must be {expected_name!r}, got {tokens[2]!r}")]
+    return []
+
+
 def check_from(instructions: list[tuple[int, str, str]]) -> list[Finding]:
     findings: list[Finding] = []
     from_lines = [(ln, rest) for ln, instr, rest in instructions if instr == "FROM"]
 
-    if len(from_lines) != 2:
+    if len(from_lines) != 3:
         return [
             Finding(
                 0,
-                f"expected exactly 2 FROM instructions (builder + Distroless final "
-                f"stage), found {len(from_lines)}",
+                f"expected exactly 3 FROM instructions (builder + security-patch + "
+                f"Distroless final stage), found {len(from_lines)}",
             )
         ]
 
     builder_line, builder_rest = from_lines[0]
-    final_line, final_rest = from_lines[1]
+    patch_line, patch_rest = from_lines[1]
+    final_line, final_rest = from_lines[2]
 
     builder_image_ref = builder_rest.split()[0]
+    patch_image_ref = patch_rest.split()[0]
     final_image_ref = final_rest.split()[0]
 
     findings += _check_digest_pinned_from(
         builder_line, builder_image_ref, EXPECTED_BUILDER_REPO, EXPECTED_BUILDER_DIGEST, "builder stage"
     )
     findings += _check_digest_pinned_from(
+        patch_line, patch_image_ref, EXPECTED_BUILDER_REPO, EXPECTED_BUILDER_DIGEST, "security-patch stage"
+    )
+    findings += _check_digest_pinned_from(
         final_line, final_image_ref, EXPECTED_FINAL_REPO, EXPECTED_FINAL_DIGEST, "final stage"
     )
 
-    builder_rest_tokens = builder_rest.split()
-    if len(builder_rest_tokens) < 3 or builder_rest_tokens[1].upper() != "AS":
-        findings.append(Finding(builder_line, f"builder stage FROM must declare 'AS builder': {builder_rest!r}"))
-    elif builder_rest_tokens[2].lower() != "builder":
-        findings.append(
-            Finding(builder_line, f"builder stage name must be 'builder', got {builder_rest_tokens[2]!r}")
-        )
+    findings += _check_stage_name(builder_line, builder_rest, "builder", "builder stage")
+    findings += _check_stage_name(patch_line, patch_rest, "security-patch", "security-patch stage")
 
     return findings
 
@@ -211,8 +249,9 @@ def check_from(instructions: list[tuple[int, str, str]]) -> list[Finding]:
 def check_no_run_in_final_stage(stages: list[list[tuple[int, str, str]]]) -> list[Finding]:
     """The Distroless final stage has no shell/coreutils to run a RUN
     instruction against - any RUN there is either dead weight or a mistake
-    that would break the build outright. Only the builder stage (stages[0])
-    may contain RUN instructions."""
+    that would break the build outright. Only the earlier stages (`builder`,
+    `security-patch`) may contain RUN instructions - neither one's own
+    content or tooling ships in the final image."""
     if len(stages) < 2:
         return []
     final_stage = stages[-1]
@@ -282,15 +321,138 @@ def check_no_sudo(instructions: list[tuple[int, str, str]]) -> list[Finding]:
     ]
 
 
-def check_no_remote_add(instructions: list[tuple[int, str, str]]) -> list[Finding]:
+def _load_runtime_patch_lock_module() -> ModuleType:
+    path = REPO_ROOT / "scripts" / "security" / "runtime_patch_lock.py"
+    spec = importlib.util.spec_from_file_location("runtime_patch_lock_for_check_dockerfile", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _security_patch_stage_index(stages: list[list[tuple[int, str, str]]]) -> int | None:
+    for idx, stage in enumerate(stages):
+        for ln, instr, rest in stage:
+            if instr != "FROM":
+                continue
+            tokens = rest.split()
+            if len(tokens) >= 3 and tokens[1].upper() == "AS" and tokens[2].lower() == "security-patch":
+                return idx
+            break
+    return None
+
+
+def check_remote_add_policy(
+    instructions: list[tuple[int, str, str]], stages: list[list[tuple[int, str, str]]]
+) -> list[Finding]:
+    """No unverified remote `ADD` (a URL as the source) anywhere - with
+    exactly ONE approved exception: the `security-patch` stage's own
+    checksum-pinned Debian-security package overlay (Day 6, see
+    docker/app/Dockerfile and security/runtime-patches.lock). That one ADD
+    must carry `--checksum=sha256:<64 hex>` and its URL/checksum must
+    match security/runtime-patches.lock's `LIBSSL_URL`/`LIBSSL_DEB_SHA256`
+    exactly - any other remote ADD (wrong stage, missing/mismatched
+    checksum, or a URL/digest that has drifted from the lock file) is
+    still rejected."""
     findings: list[Finding] = []
-    for ln, instr, rest in instructions:
-        if instr != "ADD":
-            continue
-        first_arg = rest.split()[0] if rest.split() else ""
-        if first_arg.startswith("http://") or first_arg.startswith("https://"):
-            findings.append(Finding(ln, f"ADD from a remote URL is forbidden: {first_arg}"))
+    patch_stage_index = _security_patch_stage_index(stages)
+
+    try:
+        lock = _load_runtime_patch_lock_module().load_runtime_patch_lock()
+    except Exception as exc:  # noqa: BLE001 - any load failure is a real finding, not a crash
+        lock = None
+        lock_error = str(exc)
+
+    for stage_idx, stage in enumerate(stages):
+        for ln, instr, rest in stage:
+            if instr != "ADD":
+                continue
+            tokens = rest.split()
+            checksum_flag = next((t for t in tokens if t.startswith("--checksum=")), None)
+            positional = [t for t in tokens if not t.startswith("--")]
+            src = positional[0] if positional else ""
+            if not (src.startswith("http://") or src.startswith("https://")):
+                continue  # local ADD (build-context source) - out of scope for this policy
+
+            if stage_idx != patch_stage_index:
+                findings.append(
+                    Finding(ln, f"remote ADD is only permitted in the security-patch stage: {rest}")
+                )
+                continue
+
+            if checksum_flag is None or not checksum_flag.startswith("--checksum=sha256:"):
+                findings.append(
+                    Finding(ln, f"remote ADD in the security-patch stage must use --checksum=sha256:<64 hex>: {rest}")
+                )
+                continue
+
+            digest = checksum_flag[len("--checksum=sha256:") :]
+            if not DIGEST_PATTERN.match(f"sha256:{digest}"):
+                findings.append(Finding(ln, f"remote ADD --checksum is not a well-formed sha256 digest: {rest}"))
+                continue
+
+            if lock is None:
+                findings.append(
+                    Finding(ln, f"could not load security/runtime-patches.lock to verify this ADD: {lock_error}")
+                )
+                continue
+
+            if src != lock["LIBSSL_URL"]:
+                findings.append(
+                    Finding(
+                        ln,
+                        f"remote ADD URL does not match security/runtime-patches.lock LIBSSL_URL: "
+                        f"{src!r} != {lock['LIBSSL_URL']!r}",
+                    )
+                )
+            if digest != lock["LIBSSL_DEB_SHA256"]:
+                findings.append(
+                    Finding(
+                        ln,
+                        f"remote ADD --checksum does not match security/runtime-patches.lock "
+                        f"LIBSSL_DEB_SHA256: {digest!r} != {lock['LIBSSL_DEB_SHA256']!r}",
+                    )
+                )
+
     return findings
+
+
+_REQUIRED_SECURITY_PATCH_COPY_DESTINATIONS = (
+    "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/var/lib/dpkg/status.d/libssl3t64",
+    "/var/lib/dpkg/status.d/libssl3t64.md5sums",
+)
+
+
+def check_security_patch_payload_copied(instructions: list[tuple[int, str, str]]) -> list[Finding]:
+    """The security-patch stage fetching and verifying the Debian-security
+    package is not by itself proof it does anything - this checks that the
+    final stage actually `COPY --from=security-patch`s the patched shared
+    libraries and dpkg metadata, so a Dockerfile edit that quietly dropped
+    one of those COPY lines is caught statically."""
+    copy_lines = [(ln, rest) for ln, instr, rest in instructions if instr == "COPY"]
+    from_patch = [(ln, rest) for ln, rest in copy_lines if "--from=security-patch" in rest]
+
+    if not from_patch:
+        return [
+            Finding(
+                0,
+                "no COPY --from=security-patch instruction found; the verified libssl3t64 "
+                "overlay payload is never copied into the final stage",
+            )
+        ]
+
+    destinations: set[str] = set()
+    for _, rest in from_patch:
+        non_flag_tokens = [t for t in rest.split() if not t.startswith("--")]
+        if len(non_flag_tokens) >= 2:
+            destinations.add(non_flag_tokens[-1])
+
+    missing = [dest for dest in _REQUIRED_SECURITY_PATCH_COPY_DESTINATIONS if dest not in destinations]
+    if missing:
+        return [Finding(0, f"missing COPY --from=security-patch destination(s): {missing}")]
+    return []
 
 
 def check_no_secret_vars(instructions: list[tuple[int, str, str]]) -> list[Finding]:
@@ -357,8 +519,7 @@ def check_no_privileged_concepts(instructions: list[tuple[int, str, str]]) -> li
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    dockerfile_path = repo_root / "docker" / "app" / "Dockerfile"
+    dockerfile_path = REPO_ROOT / "docker" / "app" / "Dockerfile"
 
     if not dockerfile_path.exists():
         print(f"Dockerfile not found at {dockerfile_path}", file=sys.stderr)
@@ -374,7 +535,8 @@ def main() -> int:
     all_findings += check_user(instructions)
     all_findings += check_healthcheck(instructions)
     all_findings += check_no_sudo(instructions)
-    all_findings += check_no_remote_add(instructions)
+    all_findings += check_remote_add_policy(instructions, stages)
+    all_findings += check_security_patch_payload_copied(instructions)
     all_findings += check_no_secret_vars(instructions)
     all_findings += check_workdir(instructions)
     all_findings += check_exec_form_runtime_command(instructions)
@@ -386,7 +548,7 @@ def main() -> int:
             print(f"  {finding}")
         return 1
 
-    print(f"check_dockerfile.py: OK (10 checks passed against {dockerfile_path})")
+    print(f"check_dockerfile.py: OK (12 checks passed against {dockerfile_path})")
     return 0
 
 

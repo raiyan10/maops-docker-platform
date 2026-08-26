@@ -223,6 +223,47 @@ against the current, real image satisfies the unweakened policy
 fixable HIGH finding, the correct response remains: report it plainly and
 stop, per `.claude/CLAUDE.md` - never silence it.
 
+### Day 6 emergency remediation: CVE-2026-14456 (libssl3t64)
+
+By 2026-08-26, Debian Security had published a fix for `libssl3t64`
+(`3.5.7-1~deb13u2`), and Trivy correctly reclassified CVE-2026-14456 from
+"no fix available" to "fixed" - which, unweakened, is exactly the
+release-blocking case this policy has always enforced (**any HIGH finding
+WITH a `FixedVersion` available -> FAIL**):
+
+```
+CRITICAL=0
+HIGH-with-fix=1   (CVE-2026-14456 libssl3t64 3.5.6-1~deb13u2 -> 3.5.7-1~deb13u2)
+HIGH-without-fix=16
+```
+
+The upstream `gcr.io/distroless/python3-debian13:nonroot` image at this
+project's pinned digest had not yet incorporated the Debian Security fix,
+with no ETA, and this project's policy forbids both waiting indefinitely
+and weakening the policy itself (no `.trivyignore`, no CVE allowlist - see
+"Vulnerability policy" above). The remediation actually applied was a
+narrow, checksum-pinned Debian-security package overlay on top of the
+still-pinned Distroless base - see `docs/build-security.md`'s "Day 6:
+emergency Debian-security overlay" section and `security/runtime-patches.lock`
+for the full package provenance, verification, and Dockerfile design.
+
+After the overlay, `make vuln-scan` against the same release image (now
+containing the real fixed `libssl3t64` payload, not merely updated
+metadata) reports:
+
+```
+CRITICAL=0
+HIGH-with-fix=0
+HIGH-without-fix=16
+```
+
+`scripts/security/check_trivy_report.py` itself was **not modified** -
+the policy is identical before and after; only the image's actual,
+verifiable content changed. This is documented here as a supply-chain
+event distinct from `check_trivy_report.py`'s own logic: the policy did
+its job correctly (it caught a real, newly-fixable vulnerability), and
+the response was to fix the image, not to soften the check.
+
 ## Generated artifacts
 
 `artifacts/sbom/` and `artifacts/security/` (both git-ignored - see

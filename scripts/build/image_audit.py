@@ -15,9 +15,15 @@ property (application source genuinely not writable by the runtime UID -
 see docs/build-security.md), that no repository-only/development content
 (tests, docs, `.git`, `.claude`, `.github`, scripts, secret-shaped files,
 SSH/private-key material, setuid/setgid files, world-writable source
-paths) leaked into the image, and (Day 4) that the final runtime is
+paths) leaked into the image, (Day 4) that the final runtime is
 genuinely the approved Distroless image (no shell, no package manager, no
-pip/setuptools) rather than merely tagged as one.
+pip/setuptools) rather than merely tagged as one, and (Day 6) that the
+emergency libssl3t64 Debian-security overlay (docker/app/Dockerfile's
+`security-patch` stage, security/runtime-patches.lock) is real in the
+built image - dpkg status.d reports the fixed version, the two patched
+shared libraries' content hashes match the independently-verified pins
+in the lock file, and Python's own `ssl` module actually loads and
+reflects the patched OpenSSL version.
 
 Reuses scripts/verify/security_check.py's existing image-inspection
 functions (`check_image_user`, `check_image_labels`, `check_image_healthcheck`,
@@ -91,6 +97,15 @@ def load_security_checker() -> ModuleType:
 def load_dockerfile_checker() -> ModuleType:
     path = REPO_ROOT / "scripts" / "lint" / "check_dockerfile.py"
     spec = importlib.util.spec_from_file_location("check_dockerfile_for_image_audit", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_runtime_patch_lock() -> ModuleType:
+    path = REPO_ROOT / "scripts" / "security" / "runtime_patch_lock.py"
+    spec = importlib.util.spec_from_file_location("runtime_patch_lock_for_image_audit", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -480,12 +495,100 @@ def check_expected_python_executable(container_name: str):
     )
 
 
+# --- Day 6: security/runtime-patches.lock overlay proofs ---
+#
+# These three checks prove the emergency libssl3t64 Debian-security
+# overlay (docker/app/Dockerfile's `security-patch` stage,
+# security/runtime-patches.lock) is real, end to end, against the actual
+# built image - not merely that the Dockerfile *declares* the overlay.
+# No package is re-downloaded here: the two shared-library content
+# hashes were already independently verified against the fixed .deb
+# before being pinned into runtime-patches.lock (see docs/supply-chain.md
+# for that verification), so this only needs to prove the live image's
+# own files match those already-verified hashes.
+
+
+def check_libssl_status_d_reports_fixed_version(container_name: str, lock: dict[str, str]):
+    source = "from pathlib import Path\nprint(Path('/var/lib/dpkg/status.d/libssl3t64').read_text())\n"
+    result = exec_python(container_name, source)
+    if result.returncode != 0:
+        return AuditResult(
+            "libssl3t64 dpkg status.d metadata is present and readable", False, result.stderr.strip()
+        )
+    version_line = next((line for line in result.stdout.splitlines() if line.startswith("Version:")), "")
+    reported = version_line.split(":", 1)[1].strip() if ":" in version_line else ""
+    expected = lock["LIBSSL_VERSION"]
+    passed = reported == expected
+    return AuditResult(
+        f"libssl3t64 dpkg status.d reports the fixed Version ({expected}, see security/runtime-patches.lock)",
+        passed,
+        f"reported={reported!r}",
+    )
+
+
+def check_libssl_payload_hashes_match_lock(container_name: str, lock: dict[str, str]):
+    """[D] real content-hash comparison of the two runtime shared libraries
+    the security-patch stage copies into the final image, against the
+    hashes security/runtime-patches.lock pins (themselves independently
+    verified against the official Debian Security .deb - see
+    docs/supply-chain.md). This is the binary-payload proof: it fails if
+    either file were ever left un-overlaid or overlaid with the wrong
+    content, even if the dpkg status.d metadata claims the fixed version."""
+    expected = {
+        "/usr/lib/x86_64-linux-gnu/libssl.so.3": lock["LIBSSL_SO_SHA256"],
+        "/usr/lib/x86_64-linux-gnu/libcrypto.so.3": lock["LIBCRYPTO_SO_SHA256"],
+    }
+    source = (
+        "import hashlib\n"
+        f"paths = {list(expected.keys())!r}\n"
+        "for p in paths:\n"
+        "    h = hashlib.sha256()\n"
+        "    with open(p, 'rb') as f:\n"
+        "        for chunk in iter(lambda: f.read(65536), b''):\n"
+        "            h.update(chunk)\n"
+        "    print(p, h.hexdigest())\n"
+    )
+    result = exec_python(container_name, source)
+    if result.returncode != 0:
+        return AuditResult(
+            "real fixed libssl3t64 binary payload is present (content-hash match)", False, result.stderr.strip()
+        )
+    reported = {}
+    for line in result.stdout.splitlines():
+        path, _, digest = line.strip().partition(" ")
+        reported[path] = digest
+    mismatches = {path: (reported.get(path), expected_hash) for path, expected_hash in expected.items() if reported.get(path) != expected_hash}
+    passed = not mismatches
+    return AuditResult(
+        "real fixed libssl3t64 binary payload is present (content-hash match against security/runtime-patches.lock)",
+        passed,
+        "clean" if passed else f"mismatches (actual, expected): {mismatches}",
+    )
+
+
+def check_python_ssl_runtime_reflects_patch(container_name: str, lock: dict[str, str]):
+    source = "import ssl\nprint(ssl.OPENSSL_VERSION)\nctx = ssl.create_default_context()\nprint(type(ctx).__name__)\n"
+    result = exec_python(container_name, source)
+    lines = result.stdout.splitlines()
+    openssl_version_line = lines[0].strip() if lines else ""
+    ctx_type = lines[1].strip() if len(lines) > 1 else ""
+    expected_version_token = lock["LIBSSL_VERSION"].split("-", 1)[0]
+    passed = result.returncode == 0 and expected_version_token in openssl_version_line and ctx_type == "SSLContext"
+    return AuditResult(
+        f"Python ssl module loads and reflects patched OpenSSL {expected_version_token} "
+        f"(ssl.create_default_context() succeeds)",
+        passed,
+        f"OPENSSL_VERSION={openssl_version_line!r} SSLContext={ctx_type!r}",
+    )
+
+
 def main() -> int:
     if shutil.which("docker") is None:
         print("image_audit: docker CLI not found on PATH", file=sys.stderr)
         return 1
 
     sc = load_security_checker()
+    lock = load_runtime_patch_lock().load_runtime_patch_lock()
     version = read_version()
     image = f"maops-docker-platform:{version}"
     container_name = f"maops-image-audit-{uuid.uuid4().hex[:12]}"
@@ -522,6 +625,10 @@ def main() -> int:
         results.append(check_no_package_manager(container_name))
         results.append(check_no_pip_or_setuptools(container_name))
         results.append(check_expected_python_executable(container_name))
+
+        results.append(check_libssl_status_d_reports_fixed_version(container_name, lock))
+        results.append(check_libssl_payload_hashes_match_lock(container_name, lock))
+        results.append(check_python_ssl_runtime_reflects_patch(container_name, lock))
 
     finally:
         cleanup(container_name)

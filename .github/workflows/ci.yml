@@ -81,6 +81,31 @@ jobs:
           python3 --version
           make --version
 
+      - name: Show Buildx diagnostics (default builder/driver)
+        run: |
+          docker buildx version
+          docker buildx ls
+
+      # CI environment preparation, NOT an application-image design change
+      # (see docs/ci-cd.md "GitHub-hosted runner Buildx portability"). The
+      # GitHub-hosted runner's default Buildx `docker` driver builder does
+      # not run the containerd image store, so it cannot satisfy this
+      # project's Day 4 deterministic `type=docker,rewrite-timestamp=true,
+      # dest=...` archive exporter ("Docker exporter is not supported for
+      # the docker driver") - confirmed by this branch's real first CI run
+      # (GitHub Actions run 32938805880). A job-scoped `docker-container`
+      # driver builder does support that exporter, with `--no-cache`,
+      # `SOURCE_DATE_EPOCH`, and the archive-export/`docker load` flow all
+      # unchanged - the Day 4 reproducibility model is preserved exactly.
+      # The builder name is derived only from GitHub-controlled run
+      # identifiers, never from PR/tag/title text.
+      - name: Create job-scoped Buildx builder (docker-container driver)
+        run: |
+          BUILDER_NAME="maops-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "BUILDER_NAME=${BUILDER_NAME}" >> "$GITHUB_ENV"
+          docker buildx create --driver docker-container --name "${BUILDER_NAME}" --use
+          docker buildx inspect "${BUILDER_NAME}" --bootstrap
+
       # The single authoritative release-policy gate (see Makefile):
       # quality (re-run - see docs/ci-cd.md "why quality runs twice") ->
       # build -> inspect -> image-audit -> smoke -> security-check ->
@@ -88,9 +113,21 @@ jobs:
       # supply-chain-check (sbom -> sbom-check -> vuln-scan) ->
       # `docker compose config`. GitHub's Ubuntu runner already provides
       # Docker Engine + the Compose v2 plugin - no Docker Engine
-      # installation step is added here.
+      # installation step is added here. `make build` now runs against the
+      # job-scoped docker-container builder selected above (Makefile is
+      # unchanged - `docker buildx build` always targets whichever builder
+      # is currently selected).
       - name: make release-check
         run: make release-check
+
+      - name: Remove job-scoped Buildx builder
+        if: always()
+        run: |
+          if docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
+            docker buildx rm "${BUILDER_NAME}"
+          else
+            echo "builder ${BUILDER_NAME} not found - nothing to remove"
+          fi
 
       - name: Upload SBOM and vulnerability-report evidence
         if: always()

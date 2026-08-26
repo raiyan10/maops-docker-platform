@@ -44,10 +44,12 @@ Distroless or not - not a Distroless-specific defect.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import sys
 from pathlib import Path
+from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -65,6 +67,15 @@ class SbomCheckError(ValueError):
 
 def read_version() -> str:
     return (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+
+def load_runtime_patch_lock() -> ModuleType:
+    path = REPO_ROOT / "scripts" / "security" / "runtime_patch_lock.py"
+    spec = importlib.util.spec_from_file_location("runtime_patch_lock_for_check_sbom", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def check_sbom(path: Path, expected_version: str) -> list[str]:
@@ -97,6 +108,32 @@ def check_sbom(path: Path, expected_version: str) -> list[str]:
 
     if expected_version not in path.name:
         findings.append(f"SBOM filename {path.name!r} does not encode the expected VERSION {expected_version!r}")
+
+    # Day 6: the SBOM must reflect the emergency libssl3t64 Debian-security
+    # overlay (docker/app/Dockerfile's `security-patch` stage,
+    # security/runtime-patches.lock) - if the filesystem was patched but
+    # Syft's SBOM still reports the vulnerable version, supply-chain
+    # metadata and the real image content have diverged, which is a
+    # failure in its own right (see .claude/CLAUDE.md's security proof
+    # philosophy).
+    try:
+        lock = load_runtime_patch_lock().load_runtime_patch_lock()
+    except Exception as exc:  # noqa: BLE001 - a load failure is a real finding, not a crash
+        findings.append(f"could not load security/runtime-patches.lock: {exc}")
+        lock = None
+
+    if lock is not None and isinstance(packages, list):
+        libssl_packages = [p for p in packages if isinstance(p, dict) and p.get("name") == lock["LIBSSL_PACKAGE"]]
+        if not libssl_packages:
+            findings.append(f"SBOM does not include a {lock['LIBSSL_PACKAGE']!r} package entry at all")
+        else:
+            versions = sorted({p.get("versionInfo") for p in libssl_packages})
+            if lock["LIBSSL_VERSION"] not in versions:
+                findings.append(
+                    f"SBOM {lock['LIBSSL_PACKAGE']!r} package versionInfo {versions!r} does not include the "
+                    f"patched version {lock['LIBSSL_VERSION']!r} (security/runtime-patches.lock) - the SBOM "
+                    f"and the actual patched image filesystem are inconsistent"
+                )
 
     creation_info = data.get("creationInfo", {})
     creators = creation_info.get("creators", []) if isinstance(creation_info, dict) else []

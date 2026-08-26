@@ -23,9 +23,11 @@ CI/CD automates *validation*, not the decision to actually cut a release.
 2. **Build** — `make build`. Builds `maops-docker-platform:<VERSION>`
    from `docker/app/Dockerfile` (Day 4: a two-stage build — a
    `python:3.13-slim` builder feeding a Distroless
-   `gcr.io/distroless/python3-debian13:nonroot` final runtime),
-   `VERSION`-derived, never `latest`. See `docker-build-validation` for
-   the full build/inspection procedure.
+   `gcr.io/distroless/python3-debian13:nonroot` final runtime; Day 6: a
+   third, build-time-only `security-patch` stage overlays a
+   checksum-pinned Debian-security package fix, see
+   `security/runtime-patches.lock`), `VERSION`-derived, never `latest`.
+   See `docker-build-validation` for the full build/inspection procedure.
 
 3. **Inspect** — `make inspect`. Captures `docker image inspect`/`ls`/
    `history` output; record the canonical size metric used, without
