@@ -174,6 +174,26 @@ reboot regardless of whether the process ever actually failed). An
 unexpected crash retries automatically, up to 3 times; nothing in this
 platform can crash-loop forever.
 
+**`RestartCount` semantics (Day 6, closes Day 5 finding L-1,
+`day-05-failure-recovery-review.md`):** Docker's own `RestartCount` field
+is **cumulative across automatic restart-policy attempts within one
+continuous run of the container instance** — it is not reset per crash
+episode, and `reliability_check.py`'s Scenario 2 assertion is deliberately
+written against the absolute configured maximum (`== 3`), not a delta from
+an arbitrary baseline, precisely because of this (confirmed empirically:
+Scenario 1's single transient crash already spends 1 of the 3 lifetime
+attempts, so Scenario 2's persistent condition only gets 2 *more* retries
+before hitting the same cap — `before=1, after=3`, never `before + 3`).
+Separately, and independently confirmed by real experiment: an **explicit**
+`docker start`/`docker compose start` (as opposed to an automatic
+restart-policy retry) **does reset the counter to `0`** — an operator who
+restarts a container without having fixed the underlying condition gets a
+fresh budget of 3 more automatic retries, not zero. Both properties are
+specific to this project's own Docker Desktop install (server 29.7.2,
+Compose v5.4.0 at last verification) and are not claimed as a universal
+guarantee across every Docker/`dockerd` version — re-verify before relying
+on this framing against a materially different Docker version.
+
 ## Graceful shutdown
 
 All three services declare `stop_grace_period: 10s` — real Docker
@@ -357,9 +377,13 @@ used as a correctness assertion, no `shell=True`/`os.system`/`os.popen`:
   resource-control triad above, not a metrics stack — adding one (even a
   minimal `/metrics` endpoint) is a new application-surface decision this
   release does not make.
-- **CI-enforced verification** — every gate here is still local
-  (`make release-check`); Day 6 adds CI.
-- **A container registry, or any publishing** — unchanged, Day 6 scope.
+- **CI-enforced verification** — as of Day 5 every gate here was still
+  local (`make release-check`) only; Day 6 (`docs/ci-cd.md`) now runs the
+  identical gate automatically on every pull request and push to `main`,
+  via GitHub Actions, without changing what is being verified.
+- **A container registry, or any publishing** — Day 6 added a controlled
+  GitHub Release publication workflow (`docs/ci-cd.md`); a container
+  registry remains out of scope for the full seven-day arc.
 - **Multi-replica `state`, distributed consensus, leader election** — out
   of scope by design (see `docs/persistence.md`'s "Concurrency scope").
   The restart policy in this document restarts a *single* `state`

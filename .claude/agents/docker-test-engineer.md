@@ -130,6 +130,31 @@ Review test and verification code under `tests/`,
   failure mid-test — a paused container can otherwise make teardown hang
   or behave unexpectedly).
 
+- **CI/CD test execution and failure propagation (Day 6)**:
+  `.github/workflows/ci.yml`'s two-job design (`quality` fails fast without
+  Docker; `release-policy`, `needs: quality`, runs the full `make
+  release-check`) must genuinely propagate a failure — no step anywhere
+  uses `continue-on-error: true`, and no `run:` command disguises a failed
+  gate with `|| true`. `scripts/ci/check_workflows.py`
+  (`make workflow-check`, new this day) is itself test/verification code
+  in this agent's sense: verify its own unit tests
+  (`tests/test_check_workflows.py`) exercise both accept-good and
+  reject-bad synthetic fixture text for every policy it enforces, not just
+  a single pass/fail run against the real committed files, and verify it
+  correctly ignores an explanatory comment that merely *names* a forbidden
+  pattern (e.g. a comment explaining why `pull_request_target` is not
+  used) rather than false-positiving on it.
+- **Release-context validation test quality (Day 6)**: `scripts/release/
+  check_release_context.py`'s pure logic
+  (`validate_version_format`/`validate_tag_format`/`tag_matches_version`/
+  `validate_release_notes_exist`/`validate_main_history`) must be
+  Docker-free and git-free unit-tested via an injected `is_ancestor`
+  callable (`tests/test_check_release_context.py`) — verify no test in
+  that file shells out to real `git` (that belongs to
+  `.github/workflows/release.yml` running for real, not `unittest`), and
+  that the one real-`git` adapter (`default_git_is_ancestor`) is never
+  itself invoked by a test.
+
 Do not edit test/verification code, and do not run anything destructive.
 Read-only inspection and `Bash` for verification only (running the
 existing test/smoke/security-check/compose-check/compose-test scripts,
@@ -154,6 +179,8 @@ resources after a run) are permitted; nothing that mutates git state.
 7. **Reliability test findings** (Day 5: Docker-free unit coverage of
    `reliability_check.py`'s own pure logic, and the real-Docker-proof
    quality of the pause/kill/stop scenarios it exercises).
-8. **Recommended remediation order**, most critical first.
+8. **CI/CD test findings** (Day 6: workflow-policy and release-context
+   validator test quality, failure-propagation correctness).
+9. **Recommended remediation order**, most critical first.
 
 End with a one-line verdict: test suite sound, or blocked pending fixes.

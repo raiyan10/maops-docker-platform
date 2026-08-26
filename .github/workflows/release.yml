@@ -1,0 +1,149 @@
+name: Release
+
+# Day 6 controlled release workflow (see docs/ci-cd.md). Two triggers:
+#
+#   - `push: tags: v*.*.*` - the REAL release event. Only this event can
+#     ever reach the `publish` job below.
+#   - `workflow_dispatch` on main - a SAFE, NON-PUBLISHING release-candidate
+#     dry run: validates the exact same release-policy gates a real tag
+#     event would, against `main`, before the real tag is ever created. It
+#     can never create a Git tag, a GitHub Release, or publish a container
+#     image - the `publish` job's own `if:` condition below only matches
+#     `event_name == 'push'`, never `workflow_dispatch`.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+# Deliberately NOT cancel-in-progress: interrupting an in-flight release
+# (possibly mid-publish) is exactly the kind of half-finished, unverifiable
+# state this project's "no manufactured PASS, no silent partial result"
+# philosophy rules out for a release-policy gate. A second push of the same
+# tag is also not possible (tags are immutable here - see the `publish` job)
+# so there is no legitimate "obsolete run" to cancel in the first place.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege by default: only the one job that actually publishes
+# widens this, and only on the one event that can ever reach it.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate (release-policy gates + tag/version/history)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history is required for the real-tag path's
+          # `git merge-base --is-ancestor` main-history proof below - a
+          # shallow clone would make that check meaningless.
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Show tool versions
+        run: |
+          docker version
+          docker compose version
+          python3 --version
+          make --version
+
+      - name: Report run mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "::notice::DRY RUN - release-candidate validation on ${{ github.ref_name }} (event=workflow_dispatch). This run cannot publish a GitHub Release, cannot create a Git tag, and cannot publish a container image."
+          else
+            echo "::notice::TAG RELEASE - real release event for tag ${{ github.ref_name }} at commit ${{ github.sha }}."
+          fi
+
+      # The single authoritative release-policy gate - identical in both
+      # modes, matching the spec's requirement that a dry run exercise "the
+      # same release-policy gates" a real tag event would.
+      - name: make release-check
+        run: make release-check
+
+      - name: Validate release context (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 scripts/release/check_release_context.py --mode dry-run
+
+      - name: Validate release context (real tag)
+        if: github.event_name == 'push'
+        run: |
+          python3 scripts/release/check_release_context.py \
+            --mode tag \
+            --tag "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}" \
+            --main-ref origin/main
+
+      - name: Upload release evidence (SBOM + vulnerability report)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-evidence
+          path: |
+            artifacts/sbom/
+            artifacts/security/
+          retention-days: 7
+          if-no-files-found: warn
+
+  publish:
+    name: Publish GitHub Release
+    needs: validate
+    # This condition is the sole mechanism that keeps workflow_dispatch
+    # (the dry run) from ever publishing - `if:` on a job REPLACES the
+    # default "all needed jobs succeeded" check, so success() is repeated
+    # explicitly here alongside the event-type/ref guard.
+    if: >-
+      success() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download release evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-evidence
+          path: release-evidence
+
+      - name: Refuse to overwrite an existing release (immutability)
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::GitHub Release $TAG already exists - refusing to overwrite published release evidence."
+            exit 1
+          fi
+          echo "no existing release found for $TAG - safe to publish"
+
+      - name: Compute SHA256SUMS for attached artifacts
+        run: |
+          find release-evidence -type f \( -name '*.json' \) -print0 \
+            | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "maops-docker-platform $TAG" \
+            --notes-file "docs/releases/${TAG}.md" \
+            release-evidence/sbom/*.spdx.json \
+            release-evidence/security/*.json \
+            SHA256SUMS

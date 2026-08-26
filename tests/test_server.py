@@ -80,6 +80,7 @@ class ServerTestCase(unittest.TestCase):
     state_responses: dict = DEFAULT_STATE_RESPONSES
     state_delay_seconds: float = 0.0
     use_fake_state: bool = True
+    state_timeout_seconds: float = DEFAULT_STATE_TIMEOUT_SECONDS
 
     def setUp(self) -> None:
         if self.use_fake_state:
@@ -98,7 +99,7 @@ class ServerTestCase(unittest.TestCase):
             name="test-app",
             state_host=state_host,
             state_port=state_port,
-            state_timeout_seconds=DEFAULT_STATE_TIMEOUT_SECONDS,
+            state_timeout_seconds=self.state_timeout_seconds,
         )
         self.server = build_server(config)
         self.port = self.server.server_address[1]
@@ -186,6 +187,36 @@ class ReadyzStateUnavailableTests(ServerTestCase):
         self.assertIn("error", payload)
         # No raw network exception detail (e.g. errno text) is disclosed.
         self.assertNotIn("Errno", json.dumps(payload))
+
+
+class StateTimeoutTests(ServerTestCase):
+    """Day 6 (closes Day 5 finding M-B, day-05-health-timeout-review.md):
+    a fast, Docker-free regression test proving app's own INNER hop
+    (state_dependency_timeout_seconds) actually bounds a slow `state`
+    response and converts it to a controlled 503 - mirroring
+    tests/test_gateway_server.py::UpstreamTimeoutTests for gateway's outer
+    hop. The real-Docker A-6 proof (scripts/reliability/reliability_check.py's
+    `docker pause state` scenario) remains the authoritative runtime
+    evidence that this timeout is honored end-to-end through the real
+    gateway->app->state chain; this test exists so a regression in app's
+    own timeout wiring is caught by `make test` in a fraction of a second,
+    not only by the multi-minute `make reliability-check`.
+
+    `state_delay_seconds`/`state_timeout_seconds` were already exposed as
+    fixture hooks on ServerTestCase before this test existed - no subclass
+    had ever set state_delay_seconds to a nonzero value."""
+
+    state_responses = {"/state": json_response(200, {"value": 1})}
+    state_delay_seconds = 0.5
+    state_timeout_seconds = 0.1
+
+    def test_state_inner_timeout_converts_to_controlled_503(self) -> None:
+        response = self._request("GET", "/state")
+        self.assertEqual(response.status, 503)
+        payload = json.loads(response.read_body)  # type: ignore[attr-defined]
+        self.assertIn("error", payload)
+        body_text = response.read_body.decode("utf-8")  # type: ignore[attr-defined]
+        self.assertNotIn("Traceback", body_text)
 
 
 class InfoEndpointTests(ServerTestCase):

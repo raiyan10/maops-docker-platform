@@ -477,21 +477,34 @@ def _parse_duration_seconds(value: object) -> float | None:
     return None
 
 
+CPU_EQUALITY_TOLERANCE = 0.01
+
+
 def check_resource_limits(config: dict) -> list[Finding]:
     """Day 5: every service must have an explicit, reviewable CPU/memory/PID
     limit - real Docker HostConfig values a plain `docker compose up`
     applies (the non-Swarm `cpus`/`mem_limit`/`pids_limit` fields), not a
     Swarm-only `deploy.resources.limits` block ordinary Compose ignores.
-    Rejects a missing limit, a zero/unlimited value, a negative value, and
-    unreasonably permissive drift beyond the approved targets."""
+
+    Day 6 (closes Day 5 finding L-1, day-05-resource-restart-review.md):
+    tightened from "missing/zero/negative/above-target" to EXACT equality
+    against the approved platform resource contract (a small float
+    tolerance for `cpus`, matching how `scripts/reliability/
+    reliability_check.py`'s `check_resource_limits_applied()` already
+    compares the real Docker HostConfig values) - this project now has one
+    single approved target per field, not a range, so a value that is
+    valid-but-below-target (e.g. `pids_limit: 1`, which would almost
+    certainly prevent the service from ever starting) is rejected at this
+    cheap, static gate instead of only being caught one stage later at real
+    Docker runtime."""
     findings: list[Finding] = []
     for name, service in config.get("services", {}).items():
         cpus = _parse_cpus(service.get("cpus"))
         if cpus is None or cpus <= 0:
             findings.append(Finding(f"service {name!r}: cpus is missing/zero/invalid: {service.get('cpus')!r}"))
-        elif cpus > EXPECTED_CPUS:
+        elif abs(cpus - EXPECTED_CPUS) > CPU_EQUALITY_TOLERANCE:
             findings.append(
-                Finding(f"service {name!r}: cpus={cpus} exceeds the approved target {EXPECTED_CPUS}")
+                Finding(f"service {name!r}: cpus={cpus}, expected exactly {EXPECTED_CPUS}")
             )
 
         mem_limit = _parse_bytes(service.get("mem_limit"))
@@ -499,10 +512,10 @@ def check_resource_limits(config: dict) -> list[Finding]:
             findings.append(
                 Finding(f"service {name!r}: mem_limit is missing/zero/invalid: {service.get('mem_limit')!r}")
             )
-        elif mem_limit > EXPECTED_MEM_LIMIT_BYTES:
+        elif mem_limit != EXPECTED_MEM_LIMIT_BYTES:
             findings.append(
                 Finding(
-                    f"service {name!r}: mem_limit={mem_limit} bytes exceeds the approved target "
+                    f"service {name!r}: mem_limit={mem_limit} bytes, expected exactly "
                     f"{EXPECTED_MEM_LIMIT_BYTES} bytes"
                 )
             )
@@ -512,9 +525,9 @@ def check_resource_limits(config: dict) -> list[Finding]:
             findings.append(
                 Finding(f"service {name!r}: pids_limit is missing/zero/unlimited: {service.get('pids_limit')!r}")
             )
-        elif pids_limit > EXPECTED_PIDS_LIMIT:
+        elif pids_limit != EXPECTED_PIDS_LIMIT:
             findings.append(
-                Finding(f"service {name!r}: pids_limit={pids_limit} exceeds the approved target {EXPECTED_PIDS_LIMIT}")
+                Finding(f"service {name!r}: pids_limit={pids_limit}, expected exactly {EXPECTED_PIDS_LIMIT}")
             )
     return findings
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Project-specific source validator for the app/, gateway/, state/, and
-(Day 4) scripts/build/, scripts/security/ packages.
+(Day 4) scripts/build/, scripts/security/ (Day 5: scripts/reliability/;
+Day 6: scripts/release/) packages.
 
 SCOPE (read this before trusting the result): this is a small, deliberately
 narrow AST-based check for a short, explicit list of constructs that would
@@ -21,19 +22,31 @@ process/shell execution at all):
     `urllib.parse`) is never flagged — the gateway's/app's whole job is
     making real, bounded outbound HTTP calls to a fixed configured
     upstream. `scripts/compose/`, `scripts/lint/`, `scripts/smoke/`,
-    `scripts/verify/`, and `tests/` are never scanned by either rule set
-    below — they are Docker-driving/test infrastructure, not workload or
-    the three directories this scan was deliberately widened to (Day 4:
-    `scripts/build/`, `scripts/security/`; Day 5: `scripts/reliability/`).
-  * **Tooling** (`scripts/build/`, `scripts/security/` — Day 4's; and
-    `scripts/reliability/` — Day 5's; Docker/scanner-driving
-    infrastructure): `subprocess` is explicitly permitted (each
-    directory's whole job is invoking `docker build`/`docker run`/`docker
-    compose`/the pinned Syft/Trivy scanner containers) — but `pickle`/
-    `ctypes` are still forbidden (none of the three has any legitimate
-    need for either), and every check below that isn't import-based
+    `scripts/verify/`, `scripts/ci/`, and `tests/` are never scanned by
+    either rule set below — they are Docker-driving/test/static-analysis
+    infrastructure, not workload or the four directories this scan was
+    deliberately widened to (Day 4: `scripts/build/`, `scripts/security/`;
+    Day 5: `scripts/reliability/`; Day 6: `scripts/release/`).
+    `scripts/ci/check_workflows.py` specifically has no legitimate
+    `subprocess` use at all (it is pure text/indentation analysis of the
+    committed workflow YAML, deliberately never shelling out — see its own
+    module docstring), so it is excluded here the same way
+    `scripts/compose/check_compose.py` already is, not widened into the
+    tooling rule set merely because it is new this day.
+  * **Tooling** (`scripts/build/`, `scripts/security/` — Day 4's;
+    `scripts/reliability/` — Day 5's; `scripts/release/` — Day 6's;
+    Docker/scanner/git-driving infrastructure): `subprocess` is explicitly
+    permitted (each directory's whole job is invoking `docker
+    build`/`docker run`/`docker compose`/the pinned Syft/Trivy scanner
+    containers/`git merge-base`) — but `pickle`/`ctypes` are still
+    forbidden (none of the four has any legitimate need for either), and
+    every check below that isn't import-based
     (eval/exec/os.system/os.popen/shell=True) applies identically to both
-    rule sets. Widening this scan to the tooling directories does not
+    rule sets — including, for `scripts/release/check_release_context.py`
+    specifically, the automated proof that its one real `git` subprocess
+    call never uses `shell=True` (user-controlled tag/commit strings are
+    never interpolated into a shell command - see that module's own
+    docstring). Widening this scan to the tooling directories does not
     weaken the workload's own restrictions in any way — the two rule sets
     are kept genuinely separate, not merged into one relaxed policy.
 
@@ -186,6 +199,7 @@ def main() -> int:
         repo_root / "scripts" / "build",
         repo_root / "scripts" / "security",
         repo_root / "scripts" / "reliability",
+        repo_root / "scripts" / "release",
     ]
 
     try:

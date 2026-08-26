@@ -2,7 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.platform_config import DEFAULT_STATE_DEPENDENCY_TIMEOUT_SECONDS, load_platform_config
+from app.platform_config import (
+    DEFAULT_STATE_DEPENDENCY_TIMEOUT_SECONDS,
+    MAX_STATE_DEPENDENCY_TIMEOUT_SECONDS,
+    load_platform_config,
+)
 
 
 class LoadPlatformConfigTests(unittest.TestCase):
@@ -44,6 +48,21 @@ class LoadPlatformConfigTests(unittest.TestCase):
             path.write_text('{"schema_version": 1, "state_dependency_timeout_seconds": 999}', encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_platform_config(path=path)
+
+    def test_max_boundary_timeout_is_accepted(self) -> None:
+        """Day 6 (closes Day 5 finding L-1, day-05-test-adversarial-review.md):
+        the validator's own comparison is inclusive (`0 < value <=
+        max_value`) - a value exactly AT the max must be accepted, not just
+        rejected above it. An off-by-one regression that flipped `<=` to
+        `<` would not be caught without this test."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text(
+                f'{{"schema_version": 1, "state_dependency_timeout_seconds": {MAX_STATE_DEPENDENCY_TIMEOUT_SECONDS}}}',
+                encoding="utf-8",
+            )
+            config = load_platform_config(path=path)
+            self.assertEqual(config.state_dependency_timeout_seconds, MAX_STATE_DEPENDENCY_TIMEOUT_SECONDS)
 
     def test_boolean_timeout_is_rejected(self) -> None:
         """bool is a subclass of int in Python - must be explicitly rejected."""

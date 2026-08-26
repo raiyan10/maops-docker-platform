@@ -186,3 +186,16 @@ repo-governance file, `scanners.lock` — not application runtime content),
 and any `.tar`/`.tar.gz` file — so a saved Docker image archive or a
 generated SBOM/vulnerability report can never itself leak into a
 subsequent build. See `docs/supply-chain.md`.
+
+## Delivery plane vs. runtime plane (Day 6)
+
+Everything above describes the **runtime plane**: what the image *is* and
+how it *runs*. Day 6 (`docs/ci-cd.md`) added a separate **delivery
+plane** — `.github/workflows/` (GitHub Actions), `scripts/ci/` (workflow
+policy validation), and `scripts/release/` (release-context validation) —
+that automates *when and how* the runtime plane's own existing `make`
+targets get run (on a pull request, on a push to `main`, on a release tag),
+without adding any new runtime service, changing the Dockerfile, or
+changing `compose.yaml`'s topology. The Docker-vs-Compose split described
+above is unaffected by this boundary; the delivery plane sits one layer
+above both.

@@ -13,6 +13,8 @@ job, not unittest (see .claude/CLAUDE.md).
 from __future__ import annotations
 
 import importlib.util
+import os
+import signal
 import time
 import unittest
 from pathlib import Path
@@ -237,7 +239,7 @@ class CheckCgroupV2ResourceLimitsTests(unittest.TestCase):
 
 
 class WithMemoryShrinkRestoredTests(unittest.TestCase):
-    """Docker-free proof of the Day 5 crash-remediation cleanup guarantee:
+    """Docker-free proof of the Day 5/6 crash-remediation cleanup guarantee:
     scripts/reliability/reliability_check.py's SCENARIO 2 (persistent
     failure) shrinks a real container's memory limit and MUST restore it
     under try/finally even if the wrapped action raises - a real container
@@ -245,22 +247,56 @@ class WithMemoryShrinkRestoredTests(unittest.TestCase):
     assertion inside SCENARIO 2 failed. This is exercised here purely
     against a fake `sc` (a spy recording every `docker` argv it was asked
     to run) - the real Docker-integration proof (an actual `docker update`
-    round-trip) is `make reliability-check`'s job, not unittest."""
+    round-trip) is `make reliability-check`'s job, not unittest.
+
+    Day 6 (closes Day 5 finding M-A, day-05-resource-restart-review.md):
+    restoration is now a first-class VERIFIED invariant - a failed restore
+    command, or a restore command that succeeds but the container's
+    re-inspected HostConfig doesn't actually match the original values,
+    both raise ReliabilityError (never a warning-only stderr print).
+    """
 
     def setUp(self) -> None:
         self.module = load_reliability_check()
 
-    def _spy_sc(self, original_memory: int = 134217728, original_memory_swap: int = -1) -> tuple[SimpleNamespace, list]:
+    def _spy_sc(
+        self,
+        original_memory: int = 134217728,
+        original_memory_swap: int = -1,
+        verify_memory: int | None = None,
+        verify_memory_swap: int | None = None,
+        restore_command_returncode: int = 0,
+        restore_command_stderr: str = "",
+    ) -> tuple[SimpleNamespace, list]:
+        """`verify_memory`/`verify_memory_swap` default to matching the
+        original values (a correctly-verified restore) - override either to
+        simulate a restore that reports success but didn't actually take
+        effect. The first `docker_json` call is the initial pre-shrink
+        capture; every subsequent call is treated as the post-restore
+        verification inspect."""
+        if verify_memory is None:
+            verify_memory = original_memory
+        if verify_memory_swap is None:
+            verify_memory_swap = original_memory_swap
+
         sc = _fake_sc()
         calls: list[list[str]] = []
+        inspect_calls = {"n": 0}
+        run_docker_calls = {"n": 0}
 
         def fake_docker_json(args):
             calls.append(list(args))
-            return {"Memory": original_memory, "MemorySwap": original_memory_swap}
+            inspect_calls["n"] += 1
+            if inspect_calls["n"] == 1:
+                return {"Memory": original_memory, "MemorySwap": original_memory_swap}
+            return {"Memory": verify_memory, "MemorySwap": verify_memory_swap}
 
         def fake_run_docker(args, timeout=20.0):
             calls.append(list(args))
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            run_docker_calls["n"] += 1
+            if run_docker_calls["n"] == 1:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")  # shrink always succeeds here
+            return SimpleNamespace(returncode=restore_command_returncode, stdout="", stderr=restore_command_stderr)
 
         sc.docker_json = fake_docker_json
         sc.run_docker = fake_run_docker
@@ -269,7 +305,7 @@ class WithMemoryShrinkRestoredTests(unittest.TestCase):
     def _restore_calls(self, calls: list[list[str]]) -> list[list[str]]:
         return [c for c in calls if c[:2] == ["update", "--memory"] and c[-1] == "c" and "6m" not in c]
 
-    def test_restores_original_values_on_success(self) -> None:
+    def test_successful_verified_restore_returns_action_result(self) -> None:
         sc, calls = self._spy_sc()
         result = self.module.with_memory_shrink_restored(sc, "c", "6m", "6m", lambda: "ok")
         self.assertEqual(result, "ok")
@@ -278,17 +314,19 @@ class WithMemoryShrinkRestoredTests(unittest.TestCase):
         self.assertIn("134217728", restores[0])
         self.assertIn("-1", restores[0])
 
-    def test_restores_original_values_even_when_action_raises(self) -> None:
-        """The core injected-failure cleanup proof the remediation review
-        asked for: a real assertion failure inside the wrapped action must
-        not skip the memory restore."""
+    def test_action_failure_and_successful_restore_reraises_action_exception(self) -> None:
+        """The core injected-failure cleanup proof: a real assertion
+        failure inside the wrapped action must not skip the memory
+        restore, and (since the restore succeeds and verifies) the
+        action's own exception is what propagates."""
         sc, calls = self._spy_sc(original_memory=99999999, original_memory_swap=200000000)
 
         def _boom():
             raise self.module.ReliabilityError("simulated assertion failure inside SCENARIO 2")
 
-        with self.assertRaises(self.module.ReliabilityError):
+        with self.assertRaises(self.module.ReliabilityError) as ctx:
             self.module.with_memory_shrink_restored(sc, "c", "6m", "6m", _boom)
+        self.assertIn("simulated assertion failure", str(ctx.exception))
 
         restores = self._restore_calls(calls)
         self.assertEqual(len(restores), 1, "restore must run exactly once even though the action raised")
@@ -297,8 +335,8 @@ class WithMemoryShrinkRestoredTests(unittest.TestCase):
 
     def test_restores_original_values_even_when_action_raises_unexpected_exception(self) -> None:
         """Not just ReliabilityError - ANY exception from the wrapped
-        action must still trigger the restore (a bare `finally`, not a
-        narrow `except`)."""
+        action must still trigger the restore (a bare `finally`-equivalent,
+        no narrow `except`)."""
         sc, calls = self._spy_sc()
 
         def _boom():
@@ -319,25 +357,51 @@ class WithMemoryShrinkRestoredTests(unittest.TestCase):
         with self.assertRaises(self.module.ReliabilityError):
             self.module.with_memory_shrink_restored(sc, "c", "6m", "6m", lambda: "unreachable")
 
-    def test_restore_failure_is_a_warning_not_a_raise(self) -> None:
-        """If the restore command itself fails (e.g. the container already
-        exited), the wrapped action's own success/failure must still be
-        what determines the overall outcome - a failed restore is reported
-        (stderr), not silently swallowed, but does not mask the action's
-        result."""
-        sc, calls = self._spy_sc()
-        call_count = {"n": 0}
+    def test_restore_command_failure_raises_reliability_error(self) -> None:
+        """Day 6 M-A: a failed restore `docker update` call must FAIL the
+        check, not merely warn to stderr - the action's own success must
+        not mask a permanently misconfigured container."""
+        sc, calls = self._spy_sc(restore_command_returncode=1, restore_command_stderr="container not found")
+        with self.assertRaises(self.module.ReliabilityError) as ctx:
+            self.module.with_memory_shrink_restored(sc, "c", "6m", "6m", lambda: "action-result")
+        self.assertIn("container not found", str(ctx.exception))
+        self.assertEqual(len(self._restore_calls(calls)), 1)
 
-        def fake_run_docker(args, timeout=20.0):
-            call_count["n"] += 1
-            calls.append(list(args))
-            if call_count["n"] == 1:
-                return SimpleNamespace(returncode=0, stdout="", stderr="")  # shrink succeeds
-            return SimpleNamespace(returncode=1, stdout="", stderr="container not found")  # restore fails
+    def test_restore_verification_mismatch_raises_reliability_error(self) -> None:
+        """Day 6 M-A: the restore `docker update` call can report exit 0
+        while the container's real HostConfig still doesn't match the
+        original values - this must be independently re-verified via a
+        follow-up `docker inspect`, and a mismatch must FAIL the check."""
+        sc, _ = self._spy_sc(
+            original_memory=134217728, original_memory_swap=-1,
+            verify_memory=6291456, verify_memory_swap=6291456,  # still shrunk despite "successful" restore
+        )
+        with self.assertRaises(self.module.ReliabilityError) as ctx:
+            self.module.with_memory_shrink_restored(sc, "c", "6m", "6m", lambda: "action-result")
+        message = str(ctx.exception)
+        self.assertIn("134217728", message)
+        self.assertIn("6291456", message)
 
-        sc.run_docker = fake_run_docker
-        result = self.module.with_memory_shrink_restored(sc, "c", "6m", "6m", lambda: "action-result")
-        self.assertEqual(result, "action-result")
+    def test_action_failure_and_restore_failure_precedence_and_diagnostics(self) -> None:
+        """Day 6 M-A: when BOTH the action raises AND the restore fails,
+        the restore failure is raised (the more urgent operational fact -
+        a permanently misconfigured container), with the action's own
+        exception preserved as the chained cause so neither failure's
+        diagnostics are lost."""
+        sc, calls = self._spy_sc(restore_command_returncode=1, restore_command_stderr="docker daemon unreachable")
+
+        def _boom():
+            raise self.module.ReliabilityError("action-side assertion failure")
+
+        with self.assertRaises(self.module.ReliabilityError) as ctx:
+            self.module.with_memory_shrink_restored(sc, "c", "6m", "6m", _boom)
+
+        raised = ctx.exception
+        self.assertIn("docker daemon unreachable", str(raised))
+        self.assertIsNotNone(raised.__cause__)
+        self.assertIsInstance(raised.__cause__, self.module.ReliabilityError)
+        self.assertIn("action-side assertion failure", str(raised.__cause__))
+        self.assertEqual(len(self._restore_calls(calls)), 1)
 
 
 class CheckTimeoutHierarchyConfigTests(unittest.TestCase):
@@ -355,6 +419,57 @@ class CheckTimeoutHierarchyConfigTests(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertIn("state_dependency_timeout_seconds", result.detail)
         self.assertIn("gateway_upstream_timeout_seconds", result.detail)
+
+
+class SigtermHandlingTests(unittest.TestCase):
+    """Day 6 (closes Day 5 finding L-2, day-05-failure-recovery-review.md):
+    reliability_check.py copies compose_integration.py's exact
+    _TerminatedError/_handle_sigterm/_install_sigterm_handler() pattern
+    verbatim, but previously had no Docker-free regression test of its own
+    for it (despite the identical mechanism already having one in
+    tests/test_compose_integration.py::SigtermHandlingTests, which this
+    class mirrors) - a real mid-run SIGTERM sent to the test process itself,
+    asserting _TerminatedError is raised and that a `finally` block still
+    runs (the exact guarantee reliability_check.py's own outer `finally`
+    teardown - unpause-if-paused, then `compose down -v` - depends on)."""
+
+    def setUp(self) -> None:
+        self.module = load_reliability_check()
+
+    def test_sigterm_raises_terminated_error(self) -> None:
+        self.module._install_sigterm_handler()
+        with self.assertRaises(self.module._TerminatedError):
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    def test_terminated_error_message_names_the_signal(self) -> None:
+        self.module._install_sigterm_handler()
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except self.module._TerminatedError as exc:
+            self.assertIn("SIGTERM", str(exc))
+        else:
+            self.fail("expected _TerminatedError to be raised")
+
+    def test_terminated_error_is_reachable_through_try_finally(self) -> None:
+        """Proves the property main()'s own outer try/finally teardown
+        actually relies on: a SIGTERM raised mid-try still runs the
+        finally block - a bare SIGTERM's default disposition would skip
+        `finally` entirely, orphaning the disposable Compose stack."""
+        self.module._install_sigterm_handler()
+        cleanup_ran = False
+
+        def _raise_via_signal() -> None:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        try:
+            try:
+                _raise_via_signal()
+            finally:
+                cleanup_ran = True
+        except self.module._TerminatedError:
+            pass
+
+        self.assertTrue(cleanup_ran, "finally block did not run after a SIGTERM raised mid-try")
 
 
 if __name__ == "__main__":

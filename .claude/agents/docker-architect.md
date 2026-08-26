@@ -97,6 +97,20 @@ model for:
   resource-limit/restart-policy values themselves (`compose-platform-
   engineer`'s domain — see `docs/reliability.md`).
 
+- **Delivery-plane/runtime-plane boundary (Day 6)**: `.github/workflows/`,
+  `scripts/ci/`, and `scripts/release/` are a separate **delivery plane**
+  layered on top of this document's own **runtime plane** — CI/CD must
+  never become a reason to change `docker/app/Dockerfile`'s base images,
+  build stages, PID 1/process design, or OCI metadata, and must never
+  introduce a registry-publish step (that would blur the delivery-plane/
+  runtime-plane boundary this project maintains). Confirm the GitHub
+  Actions workflows only ever *invoke* this project's existing `make`
+  targets (`make quality`, `make release-check`) rather than
+  reimplementing any build/inspection logic in workflow YAML — if a
+  workflow ever hand-rolls a `docker build`/`docker buildx build` command
+  instead of calling `make build`, flag it as scope drift into this
+  agent's own domain.
+
 Do not edit, build-and-push, publish, or run destructive Docker commands.
 Read-only inspection and `Bash` for verification only (e.g. `docker
 build`, `docker image inspect`, `docker history`, digest resolution) are

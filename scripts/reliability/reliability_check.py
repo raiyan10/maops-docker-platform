@@ -121,6 +121,12 @@ STOP_SETTLE_WINDOW_SECONDS = 3.0
 POLL_INTERVAL_SECONDS = 0.5
 REQUEST_TIMEOUT_SECONDS = 5.0
 
+# Day 6 (closes Day 5 finding L-1, day-05-health-timeout-review.md): a tight
+# band around the configured inner timeout, not a loose ">= half of it"
+# lower bound - see the inner_governed check below for the full rationale.
+INNER_GOVERNED_LOWER_RATIO = 0.75
+INNER_GOVERNED_UPPER_RATIO = 1.25
+
 EXPECTED_CPUS = 0.50
 EXPECTED_MEM_LIMIT_BYTES = 128 * 1024 * 1024
 EXPECTED_PIDS_LIMIT = 64
@@ -473,14 +479,35 @@ def check_timeout_hierarchy_config(sc: ModuleType):
 
 def with_memory_shrink_restored(sc: ModuleType, container: str, memory: str, memory_swap: str, action):
     """Shrinks `container`'s memory limit, captures its ORIGINAL values via a
-    real `docker inspect`, invokes `action()`, and ALWAYS restores the
-    original `--memory`/`--memory-swap` afterward via `docker update` - even
-    if `action` raises. This is what SCENARIO 2's persistent-failure proof
-    (below) depends on: a real container must never be left permanently
-    resource-starved just because the assertion inside `action` failed or a
-    `docker` subprocess call itself raised. Returns `action()`'s own return
-    value on success; re-raises whatever `action()` raised, after the
-    `finally` restore has already run.
+    real `docker inspect`, invokes `action()`, and ALWAYS attempts to restore
+    the original `--memory`/`--memory-swap` afterward via `docker update` -
+    even if `action` raises. This is what SCENARIO 2's persistent-failure
+    proof (below) depends on: a real container must never be left
+    permanently resource-starved just because the assertion inside `action`
+    failed or a `docker` subprocess call itself raised.
+
+    Day 6 (closes Day 5 finding M-A, day-05-resource-restart-review.md):
+    restoration is a first-class VERIFIED invariant, not a warning-only
+    best-effort. After the restore `docker update` call, this re-inspects
+    the container's real `HostConfig.Memory`/`MemorySwap` and compares
+    against the captured original values. A failed restore *command*, or a
+    restore command that reports success but the container's inspected
+    values don't actually match the original ones, both raise
+    `ReliabilityError` - never merely a `stderr` warning - so
+    `reliability-check` FAILS rather than silently reporting PASS while a
+    container stays incorrectly constrained.
+
+    Precedence when BOTH the wrapped action raised AND the restore failed/
+    was not verified: the restore failure is raised (a permanently
+    misconfigured container is the more urgent operational fact), with the
+    action's own exception attached as its `__cause__` (`raise ... from
+    action_exc`) so neither failure's diagnostics are lost - `str()` on the
+    raised exception still names the restore failure, and the action's
+    traceback remains visible via Python's own exception-chaining
+    ("The above exception was the direct cause of the following
+    exception:"). If the restore succeeds and verifies but the action
+    raised, the action's own exception is re-raised unchanged (matching the
+    pre-Day-6 behavior). No exception is ever swallowed.
 
     A pure, Docker-mockable unit of the shape this project's other reusable
     check functions already take (`sc` first, real Docker calls only
@@ -496,20 +523,49 @@ def with_memory_shrink_restored(sc: ModuleType, container: str, memory: str, mem
         raise ReliabilityError(f"docker update (shrink memory) {container} failed: {shrink_result.stderr.strip()}")
     print(f"reliability_check: shrank {container}'s memory limit to {memory} - the kernel will OOM-kill under this persistent condition")
 
+    action_exc: BaseException | None = None
+    action_result = None
     try:
-        return action()
-    finally:
-        restore_result = sc.run_docker(
-            ["update", "--memory", str(original_memory), "--memory-swap", str(original_memory_swap), container]
+        action_result = action()
+    except BaseException as exc:  # noqa: BLE001 - re-raised (or chained) below, never swallowed
+        action_exc = exc
+
+    restore_result = sc.run_docker(
+        ["update", "--memory", str(original_memory), "--memory-swap", str(original_memory_swap), container]
+    )
+    restore_command_failed = restore_result.returncode != 0
+    restore_verified = False
+    verify_detail = "restore command failed - no verification attempted"
+
+    if not restore_command_failed:
+        verify_host_config = sc.docker_json(["inspect", container, "--format", "{{json .HostConfig}}"])
+        actual_memory = verify_host_config.get("Memory")
+        actual_memory_swap = verify_host_config.get("MemorySwap")
+        restore_verified = actual_memory == original_memory and actual_memory_swap == original_memory_swap
+        verify_detail = (
+            f"post-restore HostConfig Memory={actual_memory!r} MemorySwap={actual_memory_swap!r} "
+            f"(expected {original_memory!r}/{original_memory_swap!r})"
         )
-        if restore_result.returncode != 0:
-            print(
-                f"reliability_check: WARNING: docker update (restore memory) {container} to "
-                f"{original_memory}/{original_memory_swap} failed: {restore_result.stderr.strip()}",
-                file=sys.stderr,
-            )
-        else:
-            print(f"reliability_check: restored {container}'s memory limit to {original_memory} bytes (finally block, always runs)")
+
+    if restore_command_failed or not restore_verified:
+        restore_error = ReliabilityError(
+            f"memory restore for {container} to {original_memory}/{original_memory_swap} FAILED "
+            f"(command_failed={restore_command_failed}, verified={restore_verified}): "
+            f"{restore_result.stderr.strip() if restore_command_failed else verify_detail}"
+        )
+        if action_exc is not None:
+            raise restore_error from action_exc
+        raise restore_error
+
+    print(
+        f"reliability_check: restored AND VERIFIED {container}'s memory limit to "
+        f"{original_memory} bytes ({verify_detail})"
+    )
+
+    if action_exc is not None:
+        raise action_exc
+
+    return action_result
 
 
 def main() -> int:
@@ -616,8 +672,32 @@ def main() -> int:
             bounded_by_outer = state_request_elapsed < outer_timeout
             results.append(sc.CheckResult(sc.CAT_KERNEL, f"failure completes inside the configured OUTER budget ({outer_timeout}s), not inner+outer stacked serially", bounded_by_outer, f"elapsed={state_request_elapsed:.2f}s outer_timeout={outer_timeout}s"))
 
-            inner_governed = state_request_elapsed >= inner_timeout * 0.5
-            results.append(sc.CheckResult(sc.CAT_KERNEL, f"the wait was genuinely governed by the INNER timeout ({inner_timeout}s), not an instant failure", inner_governed, f"elapsed={state_request_elapsed:.2f}s inner_timeout={inner_timeout}s"))
+            # Day 6 (closes Day 5 finding L-1, day-05-health-timeout-review.md):
+            # tightened from a loose `>= inner_timeout * 0.5` lower bound (which
+            # a much-larger-than-configured effective timeout could also have
+            # passed) to a tight band around the CONFIGURED inner timeout
+            # itself - `[inner_timeout * INNER_GOVERNED_LOWER_RATIO,
+            # inner_timeout * INNER_GOVERNED_UPPER_RATIO]`. The independent
+            # health-timeout review's own 5-trial repeated-pause probe measured
+            # 2.008s-2.035s against a configured 2.0s inner timeout (a spread
+            # of ~1.75%), so a +/-25% band is comfortably wide enough to absorb
+            # realistic CI scheduler jitter while still failing if `app`
+            # applied anywhere close to a materially different effective
+            # timeout (e.g. the outer budget instead of the inner one).
+            inner_governed = (
+                inner_timeout * INNER_GOVERNED_LOWER_RATIO
+                <= state_request_elapsed
+                <= inner_timeout * INNER_GOVERNED_UPPER_RATIO
+            )
+            results.append(sc.CheckResult(
+                sc.CAT_KERNEL,
+                f"the wait was tightly governed by the CONFIGURED inner timeout ({inner_timeout}s), "
+                f"not an instant failure and not a much-larger effective timeout",
+                inner_governed,
+                f"elapsed={state_request_elapsed:.2f}s inner_timeout={inner_timeout}s "
+                f"expected_band=[{inner_timeout * INNER_GOVERNED_LOWER_RATIO:.2f}s, "
+                f"{inner_timeout * INNER_GOVERNED_UPPER_RATIO:.2f}s]",
+            ))
 
             for result in results[-7:]:
                 print_result(result)

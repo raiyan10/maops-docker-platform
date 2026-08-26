@@ -378,8 +378,11 @@ HostConfig` values, best-effort `[D]` cgroup v2 corroboration).
 
 ## Day 4 limitations (deliberately not implemented yet)
 
-- No CI-enforced verification — gates are local (`make release-check`)
-  only; Day 6 adds CI/CD.
+- As of Day 5, gates were local (`make release-check`) only. Day 6
+  (`docs/ci-cd.md`) now runs the same gates automatically via GitHub
+  Actions on every pull request and push to `main`, with least-privilege
+  permissions, SHA-pinned actions, and no `pull_request_target` — CI/CD
+  security posture is documented there, not repeated in this file.
 - No cryptographic build provenance/attestation/signing — deferred past
   Day 4, see `docs/build-security.md`.
 - DNS-resolution-phase bound for `app`'s/`gateway`'s outbound dependency

@@ -233,9 +233,19 @@ that created them (`tempfile.TemporaryDirectory()`-scoped in both
 scripts) - never left behind, and never written anywhere but a disposable
 temp location plus the one documented artifact file.
 
+## Day 6: CI-enforced, not merely deferred
+
+CI-enforced supply-chain gating was Day 4 future scope; Day 6
+(`docs/ci-cd.md`) closed it - `.github/workflows/ci.yml`'s `release-policy`
+job and `.github/workflows/release.yml`'s `validate` job both run `make
+release-check` (which includes `supply-chain-check`: `sbom` -> `sbom-check`
+-> `vuln-scan`) on GitHub-hosted runners, uploading the generated SBOM and
+Trivy report as CI/release evidence. The policy itself (Critical=0,
+fixable-High=0) is unchanged and unweakened by running in CI - see
+`docs/ci-cd.md` for the workflow design.
+
 ## Deferred to a later day
 
-CI-enforced supply-chain gating, a container registry, cryptographic
-attestation of the SBOM/vulnerability report themselves, and automatic
-scanner-pin updates are explicitly out of Day 4 scope - see
-`docs/roadmap.md`.
+A container registry, cryptographic attestation of the SBOM/vulnerability
+report themselves, and automatic scanner-pin updates remain explicitly out
+of scope - see `docs/roadmap.md`.

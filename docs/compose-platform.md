@@ -259,11 +259,18 @@ still owned entirely by `compose_integration.py`/`make compose-test` -
 timeout-hierarchy design that closes Day 3 finding A-6, and the real
 crash/restart/pause failure-recovery proofs.
 
-## What is explicitly not implemented yet (Day 6+)
+## Day 6 additions outside this file's scope
 
-- No CI-enforced verification - Day 6; `make release-check` is the only
-  gate today.
-- No container registry or published image - Day 6.
+Day 6 (`docs/ci-cd.md`) added a GitHub Actions delivery plane (CI on every
+pull request/push, a controlled tag-triggered release workflow) that runs
+`make release-check`/`make compose-check`/`make compose-test` exactly as
+documented in this file - it does not change the Compose topology, network
+segmentation, persistence, or runtime hardening this file describes.
+
+## What is explicitly not implemented yet (Day 7+)
+
+- No container registry or published image - explicitly out of scope for
+  the full seven-day arc, not merely deferred (see `docs/ci-cd.md`).
 - No cryptographic build provenance/attestation/signing - deferred past
   Day 4, see `docs/build-security.md`.
 - No metrics endpoint, structured logging pipeline, or tracing - Day 5's
@@ -272,6 +279,5 @@ crash/restart/pause failure-recovery proofs.
   section.
 
 Do not read any bullet in this section as already implemented - see
-`docs/roadmap.md` for the authoritative day-by-day scope. Day 5
-(`docs/reliability.md`) is implemented as of this document's current
-revision.
+`docs/roadmap.md` for the authoritative day-by-day scope. Day 6
+(`docs/ci-cd.md`) is implemented as of this document's current revision.

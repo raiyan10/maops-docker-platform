@@ -49,8 +49,8 @@ services:
       context: .
       dockerfile: docker/app/Dockerfile
       args:
-        VERSION: ${VERSION:-0.5.0}
-    image: maops-docker-platform:${VERSION:-0.5.0}
+        VERSION: ${VERSION:-0.6.0}
+    image: maops-docker-platform:${VERSION:-0.6.0}
     command: ["-m", "state"]
     environment:
       STATE_HOST: "0.0.0.0"
@@ -86,8 +86,8 @@ services:
       context: .
       dockerfile: docker/app/Dockerfile
       args:
-        VERSION: ${VERSION:-0.5.0}
-    image: maops-docker-platform:${VERSION:-0.5.0}
+        VERSION: ${VERSION:-0.6.0}
+    image: maops-docker-platform:${VERSION:-0.6.0}
     command: ["-m", "app"]
     environment:
       APP_HOST: "0.0.0.0"
@@ -126,8 +126,8 @@ services:
       context: .
       dockerfile: docker/app/Dockerfile
       args:
-        VERSION: ${VERSION:-0.5.0}
-    image: maops-docker-platform:${VERSION:-0.5.0}
+        VERSION: ${VERSION:-0.6.0}
+    image: maops-docker-platform:${VERSION:-0.6.0}
     command: ["-m", "gateway"]
     # Sole host-published service, and only on loopback -- never a public
     # 0.0.0.0 bind. GATEWAY_HOST_PORT lets an automated harness (or a
