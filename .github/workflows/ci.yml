@@ -1,0 +1,141 @@
+name: CI
+
+# Day 6 delivery plane (see docs/ci-cd.md). GitHub Actions ORCHESTRATES the
+# project's existing local validation contract (the Makefile / scripts/) -
+# it does not reimplement any gate logic in workflow YAML. A developer
+# running `make quality` and `make release-check` locally exercises
+# substantially the same policy this workflow enforces.
+#
+# Deliberately NOT `pull_request_target`: that trigger runs with the base
+# repository's context (including any repository secrets) against a PR
+# author's own code, which is exactly the "PR validation with write
+# permissions/secrets" hazard this project's release-engineering scope
+# refuses to introduce. Ordinary `pull_request` runs the PR branch's own
+# workflow file, with no secret and a read-only token - see the
+# `permissions:` block below.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default: no PR run, and no ordinary push run, ever
+# needs anything beyond reading repository contents. Neither job below
+# widens this.
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality (fast, Docker-free static checks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Show tool versions
+        run: |
+          python3 --version
+          make --version
+
+      # test + lint + dockerfile-check + compose-check + workflow-check.
+      # No Docker build/run happens in this job - compose-check only
+      # renders `docker compose config` (a static parse), which the
+      # runner's pre-installed Compose v2 plugin can do without a running
+      # container. Failing here is cheap: no Docker image was built.
+      - name: make quality
+        run: make quality
+
+  release-policy:
+    name: Release policy (build, security, reliability, reproducibility, supply chain)
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Show tool versions
+        run: |
+          docker version
+          docker compose version
+          python3 --version
+          make --version
+
+      - name: Show Buildx diagnostics (default builder/driver)
+        run: |
+          docker buildx version
+          docker buildx ls
+
+      # CI environment preparation, NOT an application-image design change
+      # (see docs/ci-cd.md "GitHub-hosted runner Buildx portability"). The
+      # GitHub-hosted runner's default Buildx `docker` driver builder does
+      # not run the containerd image store, so it cannot satisfy this
+      # project's Day 4 deterministic `type=docker,rewrite-timestamp=true,
+      # dest=...` archive exporter ("Docker exporter is not supported for
+      # the docker driver") - confirmed by this branch's real first CI run
+      # (GitHub Actions run 32938805880). A job-scoped `docker-container`
+      # driver builder does support that exporter, with `--no-cache`,
+      # `SOURCE_DATE_EPOCH`, and the archive-export/`docker load` flow all
+      # unchanged - the Day 4 reproducibility model is preserved exactly.
+      # The builder name is derived only from GitHub-controlled run
+      # identifiers, never from PR/tag/title text.
+      - name: Create job-scoped Buildx builder (docker-container driver)
+        run: |
+          BUILDER_NAME="maops-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "BUILDER_NAME=${BUILDER_NAME}" >> "$GITHUB_ENV"
+          docker buildx create --driver docker-container --name "${BUILDER_NAME}" --use
+          docker buildx inspect "${BUILDER_NAME}" --bootstrap
+
+      # The single authoritative release-policy gate (see Makefile):
+      # quality (re-run - see docs/ci-cd.md "why quality runs twice") ->
+      # build -> inspect -> image-audit -> smoke -> security-check ->
+      # compose-test -> reliability-check -> reproducibility-check ->
+      # supply-chain-check (sbom -> sbom-check -> vuln-scan) ->
+      # `docker compose config`. GitHub's Ubuntu runner already provides
+      # Docker Engine + the Compose v2 plugin - no Docker Engine
+      # installation step is added here. `make build` now runs against the
+      # job-scoped docker-container builder selected above (Makefile is
+      # unchanged - `docker buildx build` always targets whichever builder
+      # is currently selected).
+      - name: make release-check
+        run: make release-check
+
+      - name: Remove job-scoped Buildx builder
+        if: always()
+        run: |
+          if docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
+            docker buildx rm "${BUILDER_NAME}"
+          else
+            echo "builder ${BUILDER_NAME} not found - nothing to remove"
+          fi
+
+      - name: Upload SBOM and vulnerability-report evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-release-evidence-${{ github.sha }}
+          path: |
+            artifacts/sbom/
+            artifacts/security/
+          retention-days: 7
+          if-no-files-found: warn

@@ -5,25 +5,29 @@ description: Reusable MAOps Docker release discipline for maops-docker-platform 
 
 # Release Readiness
 
-Reusable release procedure. As of Day 5, no CI and no container registry
-exist — do not claim otherwise, and do not scaffold either early. Steps
-that reference a PR/tag/release describe the eventual full-portfolio
-process; this repository's own current-day rule (see `.claude/CLAUDE.md`)
-is: **never commit, push, tag, or publish without explicit instruction
-from the user in that conversation.**
+Reusable release procedure. As of Day 6, GitHub Actions CI/CD exists
+(`.github/workflows/ci.yml`, `.github/workflows/release.yml` — see
+`docs/ci-cd.md`), but no container registry publication exists and none is
+planned for the full seven-day arc — do not claim otherwise, and do not
+scaffold registry publishing. This repository's own current-day rule (see
+`.claude/CLAUDE.md`) is unchanged by Day 6: **never commit, push, tag, or
+publish without explicit instruction from the user in that conversation** —
+CI/CD automates *validation*, not the decision to actually cut a release.
 
 ## Procedure
 
 1. **Quality** — `make quality` (`test` + `lint` + `dockerfile-check` +
-   `compose-check`). All four must pass; a failure anywhere stops the
-   chain.
+   `compose-check` + `workflow-check`, Day 6). All five must pass; a
+   failure anywhere stops the chain.
 
 2. **Build** — `make build`. Builds `maops-docker-platform:<VERSION>`
    from `docker/app/Dockerfile` (Day 4: a two-stage build — a
    `python:3.13-slim` builder feeding a Distroless
-   `gcr.io/distroless/python3-debian13:nonroot` final runtime),
-   `VERSION`-derived, never `latest`. See `docker-build-validation` for
-   the full build/inspection procedure.
+   `gcr.io/distroless/python3-debian13:nonroot` final runtime; Day 6: a
+   third, build-time-only `security-patch` stage overlays a
+   checksum-pinned Debian-security package fix, see
+   `security/runtime-patches.lock`), `VERSION`-derived, never `latest`.
+   See `docker-build-validation` for the full build/inspection procedure.
 
 3. **Inspect** — `make inspect`. Captures `docker image inspect`/`ls`/
    `history` output; record the canonical size metric used, without
@@ -124,28 +128,60 @@ from the user in that conversation.**
     `.claude/CLAUDE.md` — never silenced via a `.trivyignore` or a
     loosened policy threshold.
 
-12. **`make release-check`** — the single composed gate (`quality
-    (test -> lint -> dockerfile-check -> compose-check) -> build ->
-    inspect -> image-audit -> smoke -> security-check -> compose-test ->
-    reliability-check -> reproducibility-check -> sbom -> sbom-check ->
-    vuln-scan`). Every failure must propagate; nothing in this chain may
-    silently swallow a nonzero exit code.
+12. **`make workflow-check` (Day 6)** — `scripts/ci/check_workflows.py`
+    statically audits `.github/workflows/*.yml` for the security/integrity
+    invariants `docs/ci-cd.md` documents (permissions, action SHA pinning,
+    required triggers, manual-dispatch-cannot-publish, no registry
+    publication, no Day 7+ tooling). Part of `make quality`.
 
-13. **PR** — only when the user explicitly asks for one. Do not create a
-    GitHub repository, PR, tag, or release on your own initiative.
+13. **`make release-check`** — the single composed gate (`quality
+    (test -> lint -> dockerfile-check -> compose-check -> workflow-check)
+    -> build -> inspect -> image-audit -> smoke -> security-check ->
+    compose-test -> reliability-check -> reproducibility-check ->
+    supply-chain-check (sbom -> sbom-check -> vuln-scan)`). Every failure
+    must propagate; nothing in this chain may silently swallow a nonzero
+    exit code. This is also exactly what `.github/workflows/ci.yml`'s
+    `release-policy` job and `.github/workflows/release.yml`'s `validate`
+    job both run — see `docs/ci-cd.md`.
 
-14. **Merged-main validation** — once a PR exists and is merged (future
-    day, explicit instruction only), re-run this entire procedure against
-    `main` before tagging — a passing PR branch is not itself proof that
-    `main` post-merge is releasable.
+14. **PR** — only when the user explicitly asks for one. Do not create a
+    GitHub repository, PR, tag, or release on your own initiative. Once a
+    PR is opened, `.github/workflows/ci.yml` runs automatically on
+    GitHub's own runners — this is independent, clean-runner evidence, not
+    a substitute for having run `make release-check` locally first.
 
-15. **Tag/release** — only when the user explicitly asks for it, and only
-    after step 14 passes on `main`.
+15. **Merged-main validation** — once a PR exists and is merged, re-run
+    this entire procedure against `main` before tagging (locally, and via
+    `.github/workflows/ci.yml`'s own automatic run on the `push` to
+    `main`) — a passing PR branch is not itself proof that `main`
+    post-merge is releasable.
+
+16. **Release-candidate dry run (Day 6)** — only when the user explicitly
+    asks for it: a `workflow_dispatch` run of `.github/workflows/
+    release.yml` on `main` is a safe, structurally non-publishing way to
+    exercise the exact release-policy gates a real tag would, before the
+    tag exists. It can never create a tag, a GitHub Release, or publish an
+    image — see `docs/ci-cd.md`. Triggering a GitHub Actions workflow run
+    is itself an action requiring the same explicit-instruction discipline
+    as a commit/push/tag.
+
+17. **Tag/release** — only when the user explicitly asks for it, and only
+    after step 15 passes on `main`. Pushing the real `vMAJOR.MINOR.PATCH`
+    tag is what triggers `.github/workflows/release.yml`'s real
+    publication path (tag/`VERSION` equality, main-history ancestry,
+    `make release-check`, then an automated GitHub Release with SBOM/
+    Trivy-report/`SHA256SUMS` attached) — this is a one-way, immutable
+    operation (no tag is ever moved/rewritten, no existing GitHub Release
+    is ever overwritten), so treat pushing the tag with the same care as
+    any other irreversible action.
 
 ## What this skill does not cover
 
-Publishing to a registry (GHCR, Docker Hub) and CI workflow configuration
-are explicitly out of scope until a later day's scope adds them — this
-skill must not be used to justify adding either early. Cryptographic
-build provenance/attestation/signing is likewise deferred past Day 4 —
-see `docs/build-security.md`.
+Publishing the application container image to a registry (GHCR, Docker
+Hub) is explicitly out of scope for the full seven-day arc — this skill
+must not be used to justify adding it. GitHub Actions CI/CD workflow
+*configuration* itself is `docs/ci-cd.md`'s domain (implemented Day 6);
+this skill only describes *running* the resulting procedure, not authoring
+or modifying the workflow files. Cryptographic build provenance/
+attestation/signing is likewise deferred past Day 4 — see
+`docs/build-security.md`.

@@ -130,15 +130,27 @@ Review `compose.yaml` for:
   `app`'s/`gateway`'s own `/healthz` stay `200` throughout and only
   `/readyz` degrades — flag any change that makes liveness itself
   dependency-aware.
-- **Day 6+ fitness**: is the current structure simple enough to extend
-  (CI-driven verification, registry publishing) without a rewrite —
-  without you actually adding any of that now. Flag structural choices
-  that would make later growth awkward, but do not implement later-day
-  scope yourself.
+- **Compose behavior under CI (Day 6)**: `.github/workflows/ci.yml`'s
+  `release-policy` job and `.github/workflows/release.yml`'s `validate`
+  job both run `make release-check` (which includes `compose-check` and
+  `compose-test`) against the GitHub-hosted Ubuntu runner's own
+  pre-installed Docker Engine + Compose v2 plugin — no Docker Engine
+  installation step exists in either workflow. Confirm nothing about
+  running under CI weakens this file's own topology/network/volume/
+  hardening/resource/restart/timeout-hierarchy checks (e.g. a workflow
+  that skips `compose-test` "to save CI time," or that runs a hand-rolled
+  subset of `docker compose` commands instead of the real
+  `compose_integration.py`/`reliability_check.py` scripts) — flag any such
+  drift as a Day 6 regression against this file's own scope, not merely a
+  CI-configuration nit.
+- **Day 7+ fitness**: is the current structure simple enough to extend
+  further without a rewrite — without you actually adding any of that
+  now. Flag structural choices that would make later growth awkward, but
+  do not implement later-day scope yourself.
 
-Do not edit `compose.yaml`, and do not implement any Day 6+ functionality
-(CI, registry publishing, Kubernetes) even if it seems like a natural
-extension — that is explicitly out of scope for this agent and for Day 5.
+Do not edit `compose.yaml`, and do not implement any Day 7+ functionality
+(Kubernetes, a service mesh, TLS between services) even if it seems like a
+natural extension — that is explicitly out of scope for this agent.
 Read-only inspection and `Bash` for verification only (`docker compose
 config`, `scripts/compose/check_compose.py`, `scripts/compose/
 compose_integration.py`, `scripts/reliability/reliability_check.py`,
@@ -160,8 +172,9 @@ are permitted; nothing that mutates git state.
    (declared vs. really-applied to Docker `HostConfig`).
 10. **Timeout-hierarchy (A-6) findings** (invariant enforcement, real
     paused-dependency proof, liveness/readiness separation under it).
-11. **Day 6+ fitness notes** (observations only, not implementation).
-12. **Recommended remediation order**, most critical first.
+11. **Compose-under-CI findings** (Day 6: real gates run, not skipped/subset).
+12. **Day 7+ fitness notes** (observations only, not implementation).
+13. **Recommended remediation order**, most critical first.
 
 End with a one-line verdict: Compose platform sound, or blocked pending
 fixes.

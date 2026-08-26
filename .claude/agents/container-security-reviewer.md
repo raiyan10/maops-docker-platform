@@ -94,6 +94,31 @@ Review the image and runtime configuration for:
   (OOM-killed under normal load) as a correctness concern worth raising,
   even though the limit's *value* is compose-platform-engineer's call.
 
+- **CI/CD workflow trust boundary (Day 6)**: `.github/workflows/ci.yml`
+  must never use `pull_request_target` (which would run a PR's own
+  workflow file with the base repository's context/secrets against an
+  attacker-controlled branch) — `pull_request` only, with the base
+  repository's own read-only token and zero secrets available to a PR run.
+  Verify `permissions: contents: read` is the *only* permission scope
+  anywhere in `ci.yml`, and that `release.yml`'s single `contents: write`
+  scope is confined to the `publish` job, unreachable from
+  `workflow_dispatch` (see `release-engineer`'s domain for the exact `if:`
+  shape that enforces this) — `container-security-reviewer`'s interest
+  here is specifically the trust-boundary question ("can an untrusted PR
+  branch ever see a secret or a write-scoped token"), not the release
+  publication logic itself.
+- **Action supply-chain pinning (Day 6)**: every `uses:` reference in both
+  workflow files must be pinned to an immutable, full 40-character commit
+  SHA (never a floating tag/branch like `@v4`/`@main`) — verify by reading
+  `scripts/ci/check_workflows.py`'s `check_uses_pinned_to_full_sha()` and,
+  independently, by reading the two workflow files' own `uses:` lines
+  directly. Flag any third-party (non-`actions/*`) action introduced
+  without clear justification.
+- **No credential/token exposure in CI**: verify neither workflow echoes a
+  secret, enables step-debug logging, or introduces a registry credential
+  of any kind — Day 6's only credential is the built-in
+  `secrets.GITHUB_TOKEN`, scoped narrowly per job.
+
 Do not edit, run destructive commands, or grant/loosen any security
 control. Read-only inspection and `Bash` for verification only (running
 `docker inspect`, `docker exec <container> /usr/bin/python3.13 -c "..."`
@@ -101,8 +126,8 @@ to read `/proc/1/status`/attempt a write - the Day 4 Distroless final
 runtime has no shell/`cat`, so every in-container probe execs the
 absolute interpreter directly - the project's own
 `scripts/verify/security_check.py`, harmless attempted writes inside a
-throwaway container this review starts and removes itself) are
-permitted.
+throwaway container this review starts and removes itself, and reading
+`.github/workflows/*.yml`) are permitted.
 
 ## Required output format
 
@@ -115,7 +140,9 @@ permitted.
    proof).
 7. **Evidence-labeling findings** (any claim overstating its proof
    level).
-8. **Recommended remediation order**, most critical first.
+8. **CI/CD trust-boundary findings** (Day 6: `pull_request_target` usage,
+   permission scope, action pinning, secret/token exposure).
+9. **Recommended remediation order**, most critical first.
 
 End with a one-line verdict: hardening verified, or blocked pending
 fixes.

@@ -6,6 +6,9 @@ from gateway.platform_config import (
     DEFAULT_GATEWAY_UPSTREAM_TIMEOUT_SECONDS,
     DEFAULT_STATE_DEPENDENCY_TIMEOUT_SECONDS,
     DEFAULT_TIMEOUT_SAFETY_MARGIN_SECONDS,
+    MAX_GATEWAY_UPSTREAM_TIMEOUT_SECONDS,
+    MAX_STATE_DEPENDENCY_TIMEOUT_SECONDS,
+    MAX_TIMEOUT_SAFETY_MARGIN_SECONDS,
     load_platform_config,
 )
 
@@ -78,6 +81,37 @@ class LoadPlatformConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_platform_config(path=path)
 
+    def test_negative_infinity_timeout_is_rejected(self) -> None:
+        """Day 6 (closes Day 5 finding L-2, day-05-test-adversarial-review.md):
+        app/platform_config.py already has this exact test
+        (test_negative_infinity_timeout_is_rejected) - gateway's own file
+        did not, despite sharing the identical math.isfinite()-based
+        _validate_timeout implementation. Pure test-symmetry closure, no
+        behavioral change."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text('{"schema_version": 1, "gateway_upstream_timeout_seconds": -Infinity}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_platform_config(path=path)
+
+    def test_max_boundary_timeout_is_accepted(self) -> None:
+        """Day 6 (closes Day 5 finding L-1, day-05-test-adversarial-review.md):
+        a value exactly AT MAX_GATEWAY_UPSTREAM_TIMEOUT_SECONDS must be
+        accepted (the validator's own range check is inclusive)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text(
+                "{"
+                '"schema_version": 1, '
+                f'"gateway_upstream_timeout_seconds": {MAX_GATEWAY_UPSTREAM_TIMEOUT_SECONDS}, '
+                '"state_dependency_timeout_seconds": 2.0, '
+                '"timeout_safety_margin_seconds": 1.0'
+                "}",
+                encoding="utf-8",
+            )
+            config = load_platform_config(path=path)
+            self.assertEqual(config.gateway_upstream_timeout_seconds, MAX_GATEWAY_UPSTREAM_TIMEOUT_SECONDS)
+
     def test_malformed_json_fails_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "platform.json"
@@ -147,6 +181,34 @@ class StateDependencyTimeoutFieldTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_platform_config(path=path)
 
+    def test_negative_infinity_state_dependency_timeout_is_rejected(self) -> None:
+        """Day 6, closes Day 5 finding L-2 (day-05-test-adversarial-review.md)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text(
+                '{"schema_version": 1, "gateway_upstream_timeout_seconds": 6, '
+                '"state_dependency_timeout_seconds": -Infinity}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_platform_config(path=path)
+
+    def test_max_boundary_state_dependency_timeout_is_accepted(self) -> None:
+        """Day 6, closes Day 5 finding L-1 (day-05-test-adversarial-review.md)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text(
+                "{"
+                '"schema_version": 1, '
+                '"gateway_upstream_timeout_seconds": 35.0, '
+                f'"state_dependency_timeout_seconds": {MAX_STATE_DEPENDENCY_TIMEOUT_SECONDS}, '
+                '"timeout_safety_margin_seconds": 1.0'
+                "}",
+                encoding="utf-8",
+            )
+            config = load_platform_config(path=path)
+            self.assertEqual(config.state_dependency_timeout_seconds, MAX_STATE_DEPENDENCY_TIMEOUT_SECONDS)
+
 
 class TimeoutSafetyMarginFieldTests(unittest.TestCase):
     def test_zero_margin_is_rejected(self) -> None:
@@ -195,6 +257,32 @@ class TimeoutSafetyMarginFieldTests(unittest.TestCase):
             )
             config = load_platform_config(path=path)
             self.assertEqual(config.timeout_safety_margin_seconds, 2.5)
+
+    def test_negative_infinity_margin_is_rejected(self) -> None:
+        """Day 6, closes Day 5 finding L-2 (day-05-test-adversarial-review.md)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text(
+                '{"schema_version": 1, "timeout_safety_margin_seconds": -Infinity}', encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                load_platform_config(path=path)
+
+    def test_max_boundary_margin_is_accepted(self) -> None:
+        """Day 6, closes Day 5 finding L-1 (day-05-test-adversarial-review.md)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "platform.json"
+            path.write_text(
+                "{"
+                '"schema_version": 1, '
+                '"gateway_upstream_timeout_seconds": 35.0, '
+                '"state_dependency_timeout_seconds": 2.0, '
+                f'"timeout_safety_margin_seconds": {MAX_TIMEOUT_SAFETY_MARGIN_SECONDS}'
+                "}",
+                encoding="utf-8",
+            )
+            config = load_platform_config(path=path)
+            self.assertEqual(config.timeout_safety_margin_seconds, MAX_TIMEOUT_SAFETY_MARGIN_SECONDS)
 
 
 class TimeoutHierarchyInvariantTests(unittest.TestCase):

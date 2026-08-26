@@ -95,16 +95,38 @@ Review the project for release readiness:
   genuinely unfixed blocking finding should make `vuln-scan`/
   `release-check` fail, not pass via a silently added `.trivyignore` or
   loosened policy threshold.
-- **No premature publishing**: no GHCR/Docker Hub configuration, no CI
-  workflow, no tag beyond `v0.4.0`, no `v0.5.0` GitHub release exists yet
-  — confirm nothing in the repository asserts otherwise. Later days
-  (Day 6+) will add real CI/registry/release engineering; this agent owns
-  reviewing that when it arrives, but must not scaffold it early.
+- **No premature publishing beyond Day 6's own scope**: no GHCR/Docker Hub
+  configuration, no registry credentials, no `v1.0.0` tag or release —
+  confirm nothing in the repository asserts otherwise. Day 6 is genuinely
+  allowed to add GitHub Actions CI and a controlled, tag-triggered GitHub
+  Release workflow (see below) — do not flag that as premature; do flag
+  any registry-publish step, any Day 7+ tooling (Cosign, SLSA, Kubernetes),
+  or any tag/release beyond `v0.6.0` as out of scope.
+- **CI/CD workflow ownership (Day 6)**: `.github/workflows/ci.yml` and
+  `.github/workflows/release.yml` are this agent's own domain, along with
+  `scripts/ci/check_workflows.py` (`make workflow-check`) and
+  `scripts/release/check_release_context.py`. Review: every `uses:` is
+  pinned to a full 40-character commit SHA (never `@main`/`@v4`); `ci.yml`
+  never uses `pull_request_target` and grants only `permissions: contents:
+  read`; `release.yml` splits `contents: read` (`validate`) from
+  `contents: write` (`publish`, only that one job); the `publish` job's
+  `if:` condition can only ever be satisfied by a real `push: tags:
+  v*.*.*` event (`success() && github.event_name == 'push' &&
+  startsWith(github.ref, 'refs/tags/')`) — a `workflow_dispatch` dry run
+  must be structurally unable to reach it, not merely conventionally
+  unlikely to; the tag must exactly match `VERSION`; the tagged commit
+  must be proven to belong to `main`'s history
+  (`git merge-base --is-ancestor`) before publication; an existing GitHub
+  Release for the target tag must never be silently overwritten
+  (`--clobber` must never be used); and no gate anywhere uses
+  `continue-on-error: true` or `|| true` to disguise a required failure.
+  See `docs/ci-cd.md`.
 
-Do not edit, commit, push, tag, publish an image, or use `sudo`.
-Read-only inspection and `Bash` for verification only (running `make`
-targets, `docker image inspect`/`ls`/`history`) are permitted; anything
-that mutates git state or publishes is not.
+Do not edit, commit, push, tag, publish an image, publish a GitHub
+Release, or use `sudo`. Read-only inspection and `Bash` for verification
+only (running `make` targets, `docker image inspect`/`ls`/`history`,
+reading workflow YAML) are permitted; anything that mutates git state,
+triggers a GitHub Actions workflow, or publishes is not.
 
 ## Required output format
 
@@ -114,7 +136,9 @@ that mutates git state or publishes is not.
 4. **Release-check composition findings** (real dependency chain vs.
    documentation-only claim).
 5. **Premature-publishing findings** (anything that shouldn't exist yet).
-6. **Recommended implementation order** for any fixes, most critical
+6. **CI/CD workflow findings** (Day 6: permissions, action pinning,
+   tag/history validation, manual-dispatch publish safety).
+7. **Recommended implementation order** for any fixes, most critical
    first.
 
 End with a one-line verdict: release-ready, or blocked pending fixes.

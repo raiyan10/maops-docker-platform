@@ -20,7 +20,7 @@ BUILD_TAR := .cache/build/maops-docker-platform-$(VERSION).tar
 # the real, current VERSION rather than its fallback default.
 export VERSION
 
-.PHONY: help test lint dockerfile-check compose-check quality \
+.PHONY: help test lint dockerfile-check compose-check workflow-check quality \
 	build inspect image-audit smoke security-check compose-test \
 	reliability-check reproducibility-check sbom sbom-check vuln-scan \
 	supply-chain-check release-check clean
@@ -32,7 +32,8 @@ help:
 	@echo "  lint                 Run the project-specific source validator (app/, gateway/, state/)"
 	@echo "  dockerfile-check     Run the project-specific Dockerfile validator"
 	@echo "  compose-check        Run the project-specific Compose structural validator"
-	@echo "  quality              test + lint + dockerfile-check + compose-check"
+	@echo "  workflow-check       Run the project-specific GitHub Actions workflow policy validator"
+	@echo "  quality              test + lint + dockerfile-check + compose-check + workflow-check"
 	@echo ""
 	@echo "  build                Deterministic BuildKit build (slim builder -> Distroless runtime), tagged $(IMAGE)"
 	@echo "  inspect              Print image inspect/ls/history for $(IMAGE)"
@@ -50,7 +51,7 @@ help:
 	@echo ""
 	@echo "  release-check        quality + build + inspect + image-audit + smoke +"
 	@echo "                       security-check + compose-test + reliability-check +"
-	@echo "                       reproducibility-check + sbom + sbom-check + vuln-scan"
+	@echo "                       reproducibility-check + supply-chain-check"
 	@echo "  clean                Remove known project-owned generated resources"
 	@echo ""
 	@echo "Image tag is derived from VERSION: $(IMAGE)"
@@ -67,7 +68,10 @@ dockerfile-check:
 compose-check:
 	$(PYTHON) scripts/compose/check_compose.py
 
-quality: test lint dockerfile-check compose-check
+workflow-check:
+	$(PYTHON) scripts/ci/check_workflows.py
+
+quality: test lint dockerfile-check compose-check workflow-check
 
 build:
 	@mkdir -p $(dir $(BUILD_TAR))
@@ -117,7 +121,14 @@ vuln-scan:
 supply-chain-check: sbom sbom-check vuln-scan
 	@echo "supply-chain-check: sbom + sbom-check + vuln-scan all passed"
 
-release-check: quality build inspect image-audit smoke security-check compose-test reliability-check reproducibility-check sbom sbom-check vuln-scan
+# The single authoritative local release-policy contract (Day 6): a
+# developer running this locally, and GitHub Actions' release-policy job
+# (.github/workflows/ci.yml), exercise the identical target - CI
+# orchestrates this Makefile rather than hand-listing the same gate list a
+# second time. Depends on supply-chain-check (not sbom/sbom-check/vuln-scan
+# individually) so the SBOM/vulnerability policy is genuinely part of the
+# authoritative chain without duplicating its own three-step definition.
+release-check: quality build inspect image-audit smoke security-check compose-test reliability-check reproducibility-check supply-chain-check
 	@echo "=== docker compose config ==="
 	docker compose config
 

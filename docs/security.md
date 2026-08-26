@@ -376,10 +376,41 @@ crash/restart/pause proofs live in `docs/reliability.md`, not here. The
 reused there for the resource/restart proofs (`[C]` real `docker inspect
 HostConfig` values, best-effort `[D]` cgroup v2 corroboration).
 
+## Day 6 addition: emergency Debian-security overlay evidence chain
+
+`docs/build-security.md` and `docs/supply-chain.md` cover the full Day 6
+`libssl3t64`/CVE-2026-14456 remediation; this section places it in the
+`[A]`/`[B]`/`[C]`/`[D]` evidence discipline this document established.
+The overlay's real-payload claim is backed by a full evidence chain, not
+a single layer of trust:
+
+- **`[A]` source/config** — `scripts/lint/check_dockerfile.py` verifies
+  the `security-patch` stage's `ADD --checksum=` matches
+  `security/runtime-patches.lock`'s pinned URL/SHA256 exactly, and that
+  the final stage actually `COPY --from=security-patch`s the patched
+  payload — a Dockerfile that fetched the right package but forgot to
+  copy it anywhere is still caught.
+- **`[B]` image inspection** — `scripts/build/image_audit.py` reads the
+  **built image's** own `/var/lib/dpkg/status.d/libssl3t64` and confirms
+  it reports the fixed `Version:`.
+- **`[D]` kernel/process verification** — the same script computes the
+  live content hash of `libssl.so.3`/`libcrypto.so.3` **inside the built
+  image** and compares it against the hashes pinned in
+  `runtime-patches.lock` (independently verified against the official
+  Debian Security `.deb` beforehand — see `docs/supply-chain.md`), and
+  execs Python's own `ssl` module inside the image to confirm it loads,
+  reports the patched OpenSSL version, and successfully constructs an
+  `SSLContext`. A `[B]`-only claim ("status.d says 3.5.7") is never
+  presented as proof the real binaries were replaced — the `[D]`
+  content-hash and runtime checks are what actually prove that.
+
 ## Day 4 limitations (deliberately not implemented yet)
 
-- No CI-enforced verification — gates are local (`make release-check`)
-  only; Day 6 adds CI/CD.
+- As of Day 5, gates were local (`make release-check`) only. Day 6
+  (`docs/ci-cd.md`) now runs the same gates automatically via GitHub
+  Actions on every pull request and push to `main`, with least-privilege
+  permissions, SHA-pinned actions, and no `pull_request_target` — CI/CD
+  security posture is documented there, not repeated in this file.
 - No cryptographic build provenance/attestation/signing — deferred past
   Day 4, see `docs/build-security.md`.
 - DNS-resolution-phase bound for `app`'s/`gateway`'s outbound dependency

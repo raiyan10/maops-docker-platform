@@ -223,6 +223,47 @@ against the current, real image satisfies the unweakened policy
 fixable HIGH finding, the correct response remains: report it plainly and
 stop, per `.claude/CLAUDE.md` - never silence it.
 
+### Day 6 emergency remediation: CVE-2026-14456 (libssl3t64)
+
+By 2026-08-26, Debian Security had published a fix for `libssl3t64`
+(`3.5.7-1~deb13u2`), and Trivy correctly reclassified CVE-2026-14456 from
+"no fix available" to "fixed" - which, unweakened, is exactly the
+release-blocking case this policy has always enforced (**any HIGH finding
+WITH a `FixedVersion` available -> FAIL**):
+
+```
+CRITICAL=0
+HIGH-with-fix=1   (CVE-2026-14456 libssl3t64 3.5.6-1~deb13u2 -> 3.5.7-1~deb13u2)
+HIGH-without-fix=16
+```
+
+The upstream `gcr.io/distroless/python3-debian13:nonroot` image at this
+project's pinned digest had not yet incorporated the Debian Security fix,
+with no ETA, and this project's policy forbids both waiting indefinitely
+and weakening the policy itself (no `.trivyignore`, no CVE allowlist - see
+"Vulnerability policy" above). The remediation actually applied was a
+narrow, checksum-pinned Debian-security package overlay on top of the
+still-pinned Distroless base - see `docs/build-security.md`'s "Day 6:
+emergency Debian-security overlay" section and `security/runtime-patches.lock`
+for the full package provenance, verification, and Dockerfile design.
+
+After the overlay, `make vuln-scan` against the same release image (now
+containing the real fixed `libssl3t64` payload, not merely updated
+metadata) reports:
+
+```
+CRITICAL=0
+HIGH-with-fix=0
+HIGH-without-fix=16
+```
+
+`scripts/security/check_trivy_report.py` itself was **not modified** -
+the policy is identical before and after; only the image's actual,
+verifiable content changed. This is documented here as a supply-chain
+event distinct from `check_trivy_report.py`'s own logic: the policy did
+its job correctly (it caught a real, newly-fixable vulnerability), and
+the response was to fix the image, not to soften the check.
+
 ## Generated artifacts
 
 `artifacts/sbom/` and `artifacts/security/` (both git-ignored - see
@@ -233,9 +274,19 @@ that created them (`tempfile.TemporaryDirectory()`-scoped in both
 scripts) - never left behind, and never written anywhere but a disposable
 temp location plus the one documented artifact file.
 
+## Day 6: CI-enforced, not merely deferred
+
+CI-enforced supply-chain gating was Day 4 future scope; Day 6
+(`docs/ci-cd.md`) closed it - `.github/workflows/ci.yml`'s `release-policy`
+job and `.github/workflows/release.yml`'s `validate` job both run `make
+release-check` (which includes `supply-chain-check`: `sbom` -> `sbom-check`
+-> `vuln-scan`) on GitHub-hosted runners, uploading the generated SBOM and
+Trivy report as CI/release evidence. The policy itself (Critical=0,
+fixable-High=0) is unchanged and unweakened by running in CI - see
+`docs/ci-cd.md` for the workflow design.
+
 ## Deferred to a later day
 
-CI-enforced supply-chain gating, a container registry, cryptographic
-attestation of the SBOM/vulnerability report themselves, and automatic
-scanner-pin updates are explicitly out of Day 4 scope - see
-`docs/roadmap.md`.
+A container registry, cryptographic attestation of the SBOM/vulnerability
+report themselves, and automatic scanner-pin updates remain explicitly out
+of scope - see `docs/roadmap.md`.

@@ -1,6 +1,6 @@
 # Roadmap
 
-Seven-day portfolio arc. Only Days 1-5 are implemented; everything under
+Seven-day portfolio arc. Only Days 1-6 are implemented; everything under
 a later day below is **planned, not implemented** — do not read a later
 day's bullet list as describing current behavior.
 
@@ -312,13 +312,69 @@ day's bullet list as describing current behavior.
   this release's scope (see `docs/reliability.md`'s own boundary
   section).
 
-## Day 6 — CI/CD/integration/release engineering (planned)
+## Day 6 — CI/CD, integration, release engineering (v0.6.0, implemented)
 
-A CI workflow, a container registry (GHCR and/or Docker Hub), and the
-first automated end-to-end release pipeline. None of this exists on Day
-1 — `.claude/CLAUDE.md` and every agent/skill in this repository is
-explicit that no CI or registry configuration should be added before
-this day.
+A GitHub Actions delivery plane layered on top of the unchanged Days 1-5
+runtime plane — see `docs/ci-cd.md` for the full design.
+
+- **`.github/workflows/ci.yml`**: runs on every `pull_request` targeting
+  `main` and every `push` to `main`. Two jobs — `quality` (fast,
+  Docker-free: `make quality`, now including a new `workflow-check` gate)
+  fails first and cheaply; `release-policy` (`needs: quality`) runs the
+  full authoritative `make release-check` against the GitHub-hosted
+  Ubuntu runner's own pre-installed Docker Engine + Compose v2 plugin (no
+  Docker Engine installation step added). Least privilege throughout
+  (`permissions: contents: read`, no PR run ever receives a secret or a
+  write-scoped token), `pull_request_target` never used, obsolete runs for
+  the same PR/ref cancelled automatically.
+- **`.github/workflows/release.yml`**: `push: tags: v*.*.*` is the real
+  release event; `workflow_dispatch` on `main` is a safe, structurally
+  non-publishing release-candidate dry run (the `publish` job's own `if:`
+  condition can only ever be satisfied by a real tag push - see
+  `docs/ci-cd.md`). Real-tag publication additionally proves the tagged
+  commit belongs to `main`'s history (`git merge-base --is-ancestor`) and
+  that the tag exactly matches `VERSION`, before creating a GitHub Release
+  (GitHub CLI, `contents: write` scoped to only that one job) with the
+  release image's SBOM, Trivy vulnerability report, and a `SHA256SUMS`
+  file attached. Tags/releases are never moved, rewritten, or overwritten.
+- **No container registry publication** - this was an earlier draft's
+  assumption for this day and is explicitly corrected here: the GitHub
+  Release (with its attached security/release evidence) is Day 6's entire
+  delivery destination. No `docker login`/`docker push`, no GHCR/Docker
+  Hub/ECR/ACR configuration, and no registry credential exists anywhere in
+  this repository - `scripts/ci/check_workflows.py` statically enforces
+  this absence. A container registry remains out of this project's scope
+  for the full seven-day arc unless a future scope decision explicitly
+  adds one.
+- Two new repository-owned, Docker-free-testable validation scripts:
+  `scripts/ci/check_workflows.py` (`make workflow-check`) statically
+  audits the two committed workflow files for the security/integrity
+  invariants above; `scripts/release/check_release_context.py` validates
+  `VERSION`/tag format, tag-vs-`VERSION` equality, release-notes presence,
+  and main-history ancestry, with pure logic separated from the one real
+  `git` call it needs (never `shell=True`, argv-only).
+- Closed the Day 5 final adjudication's carried-forward test/harness
+  findings (3 Medium + 6 Low) now that automated gates are authoritative -
+  see `docs/releases/v0.6.0.md` for the itemized closure list. The seven
+  untouched Day 4 carried-forward findings remain open at their previously
+  adjudicated severity.
+- `VERSION` bumped `0.5.0` → `0.6.0`; the same version-consistency chain
+  extends with no new duplicated version literal.
+- Runtime plane unchanged: still exactly `gateway -> app -> state`, three
+  services, two networks, one named volume, one application image. Still
+  no Cosign/SLSA/provenance attestation, no Kubernetes/Helm/Argo CD, no
+  Prometheus/Grafana/OpenTelemetry, no Terraform/Ansible - all explicitly
+  Day 7+ scope or out of this project's scope entirely (see below).
+- **Emergency Debian-security overlay** (in-scope hotfix, not a new
+  day): `make release-check`'s unweakened vulnerability policy caught a
+  real, fixable HIGH finding (CVE-2026-14456, `libssl3t64`) after the
+  pinned Distroless digest lagged an already-published Debian Security
+  fix. Remediated with a narrow, checksum-pinned Debian-security package
+  overlay (a new `security-patch` build stage in `docker/app/Dockerfile`,
+  pinned via `security/runtime-patches.lock`) rather than a base-image
+  migration or a policy weakening - see `docs/build-security.md` and
+  `docs/supply-chain.md`. The Distroless base digest and the runtime
+  topology above are both unchanged.
 
 ## Day 7 — Hardening, reviews, showcase -> v1.0.0 (planned)
 

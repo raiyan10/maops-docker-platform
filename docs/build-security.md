@@ -51,7 +51,7 @@ image.
 (index digest; resolves to a `linux/amd64` manifest digest of
 `sha256:ed7cd592da15a32d0c7a0a7649f4d2e46b5b381a78a11ab3924ea3ce39c06a6c`)
 
-## Two-stage build
+## Two-stage build (Day 4; a third stage was added Day 6 - see below)
 
 `docker/app/Dockerfile` is now a two-stage build - not because the
 application gained a compile step, but because the shellless final
@@ -104,6 +104,79 @@ under the `python:3.13-slim` runtime. The Distroless image has no
 `/etc/passwd` entry for `10001`, which is fine: a numeric `USER
 UID:GID` needs no `/etc/passwd` lookup, and the `nonroot` tag is used only
 for its minimal, shell-free *content*, never as an identity source.
+
+## Day 6: emergency Debian-security overlay (`security-patch` stage)
+
+`gcr.io/distroless/python3-debian13:nonroot` at the exact digest pinned
+above ships `libssl3t64 3.5.6-1~deb13u2`, vulnerable to CVE-2026-14456 (a
+HIGH-severity, fixable finding - see `docs/supply-chain.md`'s
+vulnerability policy). Debian Security had already published the fix
+(`3.5.7-1~deb13u2`) at the time this was discovered, but the upstream
+Distroless rebuild had not yet incorporated it, with no ETA. This
+project's policy forbids both waiting indefinitely on an upstream rebuild
+and weakening the vulnerability policy itself (no `.trivyignore`, no CVE
+allowlist, no severity rewrite - see `.claude/CLAUDE.md`), so a third
+build stage was added:
+
+```
+FROM python:3.13-slim@sha256:ffb752...30a AS security-patch
+ADD --checksum=sha256:<verified> https://snapshot.debian.org/.../libssl3t64_3.5.7-1~deb13u2_amd64.deb /tmp/libssl3t64.deb
+RUN dpkg-deb -x ... && dpkg-deb -e ...   # extract real payload + real control metadata
+```
+
+**What this is, precisely**: the *exact*, official, checksum-pinned
+Debian Security package (`libssl3t64_3.5.7-1~deb13u2_amd64.deb`),
+downloaded via BuildKit's `ADD --checksum=sha256:...` (the frontend
+itself refuses the build if the downloaded bytes don't match - no
+`apt-get upgrade` against a moving repository, no unverified
+curl-pipe-to-anywhere), from an **immutable** `snapshot.debian.org`
+archive URL (a fixed timestamp, `20260825T185058Z`, not a mutable
+"current" mirror path). `dpkg-deb -x` extracts the real binary payload
+(`libssl.so.3`, `libcrypto.so.3`, the `engines-3/` plugins); `dpkg-deb -e`
+extracts the package's own real `control`/`md5sums` metadata, copied
+verbatim (only renamed, per Distroless's own `status.d/<pkg>` /
+`status.d/<pkg>.md5sums` layout) into the final stage - never a
+hand-written or minimal status.d entry invented to satisfy a scanner.
+
+**What this is not**: a base-image migration. The Distroless digest
+pinned above is unchanged. The final runtime is accurately described as
+"pinned Distroless Python Debian 13 + pinned Debian-security libssl3t64
+overlay" - never as byte-identical to upstream Distroless, and never
+described as a base-image swap.
+
+**Verification performed before pinning** (see `security/runtime-patches.lock`
+and `docs/supply-chain.md` for the full record): the package's SHA256 was
+computed from the downloaded `.deb` and independently cross-checked
+against the SHA256 published in Debian Security's own signed
+`trixie-security`/`main`/`binary-amd64` `Packages` index at the same
+snapshot timestamp - not merely trusted from the download in isolation.
+`security-tracker.debian.org` independently confirms trixie is vulnerable
+at `3.5.6-1~deb13u2` and fixed in `trixie-security` at `3.5.7-1~deb13u2`.
+
+**Three layers of automated proof this overlay is real, not metadata
+spoofing**:
+
+1. `scripts/lint/check_dockerfile.py` (source/config, `[A]`) - the
+   `security-patch` stage reuses the same digest-pinned `python:3.13-slim`
+   builder (no new base image), its `ADD --checksum=` is cross-checked
+   against `security/runtime-patches.lock`'s pinned URL/SHA256, and the
+   final stage is checked to actually `COPY --from=security-patch` the
+   patched libraries and dpkg metadata.
+2. `scripts/build/image_audit.py` (image/kernel inspection, `[B]`/`[D]`) -
+   against the **built image**: dpkg `status.d` reports the fixed
+   `Version:`, the two shared libraries' live content hashes match the
+   hashes pinned in `runtime-patches.lock` (themselves already verified
+   against the official `.deb` - no re-download at audit time), and
+   Python's own `ssl` module actually loads, reports the patched OpenSSL
+   version, and successfully constructs an `SSLContext`.
+3. `scripts/security/check_sbom.py` - the generated SBOM's `libssl3t64`
+   `versionInfo` must include the patched version; a patched filesystem
+   with stale SBOM metadata is treated as a failure, not a soft warning.
+
+The build remains strongly reproducible (`make reproducibility-check`):
+`ADD --checksum=` fetches the identical, cryptographically-pinned bytes
+on every build, so two independent `--no-cache` builds still produce an
+exact image-ID match.
 
 ## Deterministic build strategy (unchanged mechanism, still verified after migration)
 

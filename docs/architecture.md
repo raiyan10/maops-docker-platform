@@ -150,6 +150,16 @@ flushed immediately rather than buffered until process exit.
   `docs/build-security.md` for the full rationale and the base-image
   rejection this replaced (`python:3.13-slim`, rejected on unfixed
   CRITICAL findings).
+  **Day 6 addition**: a third, build-time-only `security-patch` stage was
+  inserted between the two — a checksum-pinned Debian-security package
+  overlay closing a real, fixable vulnerability-policy finding
+  (CVE-2026-14456) that the pinned Distroless digest had not yet picked
+  up upstream. It reuses the same builder base image (no new base
+  introduced) and never enters the final image itself beyond the specific
+  verified files it copies in; the final stage remains shellless and
+  package-manager-free. This is again a *build-image* change only — see
+  `docs/build-security.md`'s "Day 6: emergency Debian-security overlay"
+  section.
 - **`compose.yaml`** owns everything about how the image is *run*: which
   role each service plays (`command:`), port mapping (`app`/`state`:
   none; `gateway`: loopback-only), environment variables, the per-role
@@ -186,3 +196,21 @@ repo-governance file, `scanners.lock` — not application runtime content),
 and any `.tar`/`.tar.gz` file — so a saved Docker image archive or a
 generated SBOM/vulnerability report can never itself leak into a
 subsequent build. See `docs/supply-chain.md`.
+
+## Delivery plane vs. runtime plane (Day 6)
+
+Everything above describes the **runtime plane**: what the image *is* and
+how it *runs*. Day 6 (`docs/ci-cd.md`) added a separate **delivery
+plane** — `.github/workflows/` (GitHub Actions), `scripts/ci/` (workflow
+policy validation), and `scripts/release/` (release-context validation) —
+that automates *when and how* the runtime plane's own existing `make`
+targets get run (on a pull request, on a push to `main`, on a release tag),
+without adding any new runtime service or changing `compose.yaml`'s
+topology. (`docker/app/Dockerfile` itself did gain a third,
+build-time-only `security-patch` stage during Day 6 — see
+`docs/build-security.md` — but that is a runtime-plane image-security fix,
+not a delivery-plane change: it does not add a service, alter the 3
+services/2 networks/1 volume topology, or touch `.github/workflows/`.)
+The Docker-vs-Compose split described
+above is unaffected by this boundary; the delivery plane sits one layer
+above both.

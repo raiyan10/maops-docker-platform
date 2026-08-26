@@ -27,7 +27,8 @@ def load_check_sbom() -> ModuleType:
 def _valid_sbom(version: str = "0.4.0") -> dict:
     # Distroless dpkg-status-derived package names (Day 4) - not the
     # literal "python" name python:3.13-slim's own dpkg database happened
-    # to also carry.
+    # to also carry. libssl3t64's versionInfo must match the real,
+    # checked-in security/runtime-patches.lock's LIBSSL_VERSION (Day 6).
     return {
         "spdxVersion": "SPDX-2.3",
         "name": "/input.tar",
@@ -35,6 +36,7 @@ def _valid_sbom(version: str = "0.4.0") -> dict:
             {"name": "python3.13-minimal", "versionInfo": "3.13.5-1"},
             {"name": "libpython3.13-stdlib", "versionInfo": "3.13.5-1"},
             {"name": "libc6", "versionInfo": "2.41-8"},
+            {"name": "libssl3t64", "versionInfo": "3.5.7-1~deb13u2"},
         ],
         "creationInfo": {"creators": ["Organization: Anchore, Inc", "Tool: syft-1.51.0"]},
     }
@@ -91,11 +93,37 @@ class CheckSbomTests(unittest.TestCase):
         satisfy this check, not just the literal 'python' name
         python:3.13-slim's own dpkg database happened to also carry."""
         payload = _valid_sbom()
-        payload["packages"] = [{"name": "python3.13-minimal", "versionInfo": "3.13.5-1"}]
+        payload["packages"] = [
+            {"name": "python3.13-minimal", "versionInfo": "3.13.5-1"},
+            {"name": "libssl3t64", "versionInfo": "3.5.7-1~deb13u2"},
+        ]
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = self._write(tmp_dir, "x-0.4.0.spdx.json", json.dumps(payload))
             findings = self.module.check_sbom(path, "0.4.0")
             self.assertEqual(findings, [])
+
+    def test_missing_libssl_package_is_rejected(self) -> None:
+        """Day 6: the SBOM must reflect the emergency libssl3t64
+        Debian-security overlay (security/runtime-patches.lock)."""
+        payload = _valid_sbom()
+        payload["packages"] = [{"name": "python3.13-minimal", "versionInfo": "3.13.5-1"}]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = self._write(tmp_dir, "x-0.4.0.spdx.json", json.dumps(payload))
+            findings = self.module.check_sbom(path, "0.4.0")
+            self.assertTrue(any("libssl3t64" in f and "does not include" in f for f in findings))
+
+    def test_stale_libssl_version_is_rejected(self) -> None:
+        """If the filesystem was patched but the SBOM still reports the
+        vulnerable version, supply-chain metadata and the real image
+        content have diverged - this must fail, not pass silently."""
+        payload = _valid_sbom()
+        for pkg in payload["packages"]:
+            if pkg["name"] == "libssl3t64":
+                pkg["versionInfo"] = "3.5.6-1~deb13u2"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = self._write(tmp_dir, "x-0.4.0.spdx.json", json.dumps(payload))
+            findings = self.module.check_sbom(path, "0.4.0")
+            self.assertTrue(any("does not include the" in f and "patched version" in f for f in findings))
 
     def test_version_mismatch_in_filename_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

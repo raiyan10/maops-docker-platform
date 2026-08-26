@@ -16,6 +16,42 @@ application is intentionally tiny — a few JSON endpoints — so that
 essentially all of the engineering effort and all of the review surface
 is the container layer, not application logic.
 
+## Day 6 additions (CI/CD and release engineering)
+
+- **A GitHub Actions delivery plane** layered on top of the unchanged
+  runtime plane: `.github/workflows/ci.yml` runs `make quality` (now
+  including a new `workflow-check` gate) then the full `make
+  release-check` on every pull request and every push to `main`;
+  `.github/workflows/release.yml` implements a safe, non-publishing
+  release-candidate dry run (`workflow_dispatch`) and a controlled,
+  tag-triggered (`push: tags: v*.*.*`) GitHub Release publication with
+  main-history verification, least-privilege permissions split by job, and
+  every action pinned to an immutable commit SHA. See
+  [docs/ci-cd.md](docs/ci-cd.md).
+- **No container registry publication** — the GitHub Release (with its
+  attached SBOM, vulnerability report, and checksums) is Day 6's entire
+  delivery destination; no `docker push`/GHCR/Docker Hub configuration
+  exists anywhere in this repository.
+- Two new repository-owned validators: `scripts/ci/check_workflows.py`
+  (`make workflow-check`) statically audits the committed workflow files;
+  `scripts/release/check_release_context.py` validates `VERSION`/tag
+  format, tag-vs-`VERSION` equality, release-notes presence, and
+  main-history ancestry.
+- Closed the Day 5 final adjudication's carried-forward test/harness
+  findings (3 Medium + 6 Low) — see
+  [docs/releases/v0.6.0.md](docs/releases/v0.6.0.md).
+- Runtime architecture unchanged: still exactly `gateway -> app -> state`,
+  three services, two networks, one named volume, one application image.
+- **Emergency Debian-security overlay**: `make release-check`'s
+  unweakened vulnerability policy caught a real, fixable HIGH finding
+  (CVE-2026-14456, `libssl3t64`) that the pinned Distroless digest had not
+  yet picked up upstream. A checksum-pinned, official Debian Security
+  package overlay (a new `security-patch` build stage) fixes it without
+  migrating the runtime base or weakening the policy — see
+  [docs/build-security.md](docs/build-security.md) and
+  [docs/supply-chain.md](docs/supply-chain.md), and
+  `security/runtime-patches.lock` for the exact pin.
+
 ## Day 5 additions (health, reliability, resource controls)
 
 - **Liveness vs. readiness formalized as a platform-wide contract**:
@@ -64,10 +100,11 @@ is the container layer, not application logic.
   findings); Distroless was adopted after real vulnerability scanning,
   runtime testing, and reproducibility re-verification all passed against
   it. See [docs/build-security.md](docs/build-security.md).
-- **Two-stage build**: a digest-pinned `python:3.13-slim` builder stage
-  (filesystem preparation only) feeding the digest-pinned Distroless
-  final stage — the builder's own toolchain never enters the release
-  image.
+- **Two-stage build** (a third, build-time-only `security-patch` stage
+  was added Day 6 — see below): a digest-pinned `python:3.13-slim`
+  builder stage (filesystem preparation only) feeding the digest-pinned
+  Distroless final stage — the builder's own toolchain never enters the
+  release image.
 - A deterministic BuildKit/buildx release build (`make build`) — two
   independent, clean builds from the identical source tree produce a
   **byte-identical image ID**, proven by `make reproducibility-check`
@@ -154,7 +191,7 @@ is the container layer, not application logic.
   lifecycle check (see [docs/security.md](docs/security.md)).
 
 See [docs/roadmap.md](docs/roadmap.md) for the full seven-day arc — only
-Days 1-5 are implemented; everything else is explicitly planned, not
+Days 1-6 are implemented; everything else is explicitly planned, not
 built.
 
 ## Prerequisites
@@ -173,7 +210,8 @@ make test             # unittest suite (app/ + gateway/ + state/)
 make lint              # project-specific source validator (app/, gateway/, state/)
 make dockerfile-check    # project-specific Dockerfile validator
 make compose-check         # project-specific Compose structural validator
-make quality                 # test + lint + dockerfile-check + compose-check
+make workflow-check           # project-specific GitHub Actions workflow policy validator
+make quality                    # test + lint + dockerfile-check + compose-check + workflow-check
 
 make build                     # deterministic BuildKit build, tagged maops-docker-platform:<VERSION>
 make inspect                     # docker image inspect / ls / history
@@ -191,7 +229,7 @@ make supply-chain-check                            # sbom + sbom-check + vuln-sc
 
 make release-check   # quality + build + inspect + image-audit + smoke + security-check +
                       #   compose-test + reliability-check + reproducibility-check +
-                      #   sbom + sbom-check + vuln-scan
+                      #   supply-chain-check (sbom + sbom-check + vuln-scan)
 
 docker compose up -d                       # run the stack locally (state -> app -> gateway)
 curl http://localhost:8080/readyz            # via the gateway (loopback-only;
@@ -224,7 +262,8 @@ vulnerability scanning, and this project's explicit vulnerability policy,
 and [docs/reliability.md](docs/reliability.md) for the liveness/readiness
 contract, the Day 5 timeout-hierarchy design that closes Day 3 finding
 A-6, resource controls, and the real crash/restart/pause failure-recovery
-proofs.
+proofs. [docs/ci-cd.md](docs/ci-cd.md) documents the Day 6 delivery plane
+that now automates every gate above on every pull request and push.
 
 ## Repository structure
 
@@ -234,9 +273,11 @@ gateway/                 # stdlib-only Python gateway (Day 2, sole host-facing s
 state/                   # stdlib-only Python persistence service (Day 3)
 config/platform.json     # non-secret, Compose-mounted runtime configuration (Day 3, timeout fields updated Day 5)
 security/scanners.lock   # digest-pinned Syft/Trivy scanner references (Day 4)
-docker/app/Dockerfile    # two-stage: slim builder -> Distroless final runtime, non-root, all three roles
+security/runtime-patches.lock  # checksum-pinned emergency Debian-security package overlay (Day 6)
+docker/app/Dockerfile    # 3-stage: slim builder -> security-patch overlay -> Distroless final runtime, non-root, all three roles
 compose.yaml             # three-service hardened Compose stack (state -> app -> gateway, resource/restart-bounded, Day 5)
-tests/                   # unittest suite (app/ + gateway/ + state/ + Day 4/5 tooling)
+.github/workflows/       # CI + release delivery plane (Day 6) - see docs/ci-cd.md
+tests/                   # unittest suite (app/ + gateway/ + state/ + Day 4/5/6 tooling)
 scripts/lint/            # project-specific source + Dockerfile validators
 scripts/compose/         # project-specific Compose structural + integration checks
 scripts/smoke/           # real-image container smoke test (single-role + multi-role)
@@ -244,17 +285,20 @@ scripts/verify/          # runtime security verification
 scripts/build/           # deterministic-build reproducibility proof + image policy audit (Day 4)
 scripts/security/        # SBOM generation/validation + vulnerability scan/policy (Day 4)
 scripts/reliability/     # real resource/restart/timeout-hierarchy/failure-recovery proof (Day 5)
+scripts/ci/              # GitHub Actions workflow policy validator (Day 6)
+scripts/release/         # release-context (VERSION/tag/history) validator (Day 6)
+docs/releases/           # version-specific GitHub Release notes (Day 6)
 artifacts/               # generated SBOM/vulnerability-report output (git-ignored)
 docs/                    # architecture, security, networking, configuration,
                          #   persistence, compose platform, build security,
-                         #   supply chain, reliability, roadmap
+                         #   supply chain, reliability, ci-cd, roadmap
 .claude/                 # project agents, skills, and guidance
 VERSION                  # single authoritative version source
 ```
 
 ## Current version
 
-`0.5.0` (see `VERSION`) — Day 5 of 7.
+`0.6.0` (see `VERSION`) — Day 6 of 7.
 
 ## Seven-day roadmap (high level)
 
@@ -264,8 +308,8 @@ VERSION                  # single authoritative version source
 | 2 | Compose multi-service topology |
 | 3 | Networking, configuration, volumes, persistence |
 | 4 | Build/image security and reproducibility |
-| 5 | Health, reliability, resource controls *(this release)* |
-| 6 | CI/CD, integration, release engineering |
+| 5 | Health, reliability, resource controls |
+| 6 | CI/CD, integration, release engineering *(this release)* |
 | 7 | Hardening, reviews, showcase -> v1.0.0 |
 
 Full detail: [docs/roadmap.md](docs/roadmap.md).
