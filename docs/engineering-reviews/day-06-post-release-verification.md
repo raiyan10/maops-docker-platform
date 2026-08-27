@@ -10,6 +10,16 @@ released as part of producing this document. The only file created is
 this one.
 Date: 2026-08-27.
 
+> **Correction / addendum (2026-08-27).** This record has been corrected
+> based on newly discovered authoritative GitHub Actions evidence. §2.4
+> previously stated that automatic merged-`main` push CI did not
+> materialize and provisionally attributed this to a GitHub-side trigger
+> anomaly; that statement and conclusion are withdrawn — see §2.4 for the
+> corrected account. A new §6 documents post-release evidence-commit CI
+> (a real, later, single-attempt failure on a documentation-only commit,
+> resolved on rerun with no implementation change), and a new finding
+> DAY6-POST-M2 (§7.2) is added. `v0.6.0` itself is unaffected — see §10.
+
 ---
 
 ## 1. Release identity
@@ -56,33 +66,38 @@ retroactively clean narrative.
 PR #6 was then merged to `main` (merge commit
 `eb043b4e9a62df8717399c9ab136fb722dc9bd0b`).
 
-### 2.4 Missing automatic push CI on `main`
+### 2.4 Automatic merged-main push CI (corrected)
 
-The expected automatic `push`-triggered CI run on `main` for the merge
-commit did **not** materialize as a workflow run. This was investigated,
-not assumed:
+Authoritative GitHub Actions evidence now proves that the automatic
+`push`-triggered CI run on `main` for the merge commit **did** run:
 
-- The CI workflow is active.
-- `push` trigger branches include `[main]`.
-- No `paths-ignore` filter exists that would exclude the merge.
-- The merge SHA (`eb043b4e9a62df8717399c9ab136fb722dc9bd0b`) is correct
-  and matches the dereferenced tag.
-- No skip-CI token (`[skip ci]`/`[ci skip]`) is present in the merge
-  message.
-- The merge was performed outside the Actions `GITHUB_TOKEN` context
-  (i.e., not by a GitHub Actions-authored push), which is a documented
-  GitHub Actions condition under which some automatic `push`-triggered
-  workflow runs can fail to fire.
-- The exact root cause was **not** established with certainty.
+| Field | Value |
+|---|---|
+| Run | `32990848068` |
+| Event | `push` |
+| Branch | `main` |
+| headSha | `eb043b4e9a62df8717399c9ab136fb722dc9bd0b` |
+| Quality (fast, Docker-free static checks) | SUCCESS |
+| Release policy (build, security, reliability, reproducibility, supply chain) | SUCCESS |
 
-This is recorded as a **GitHub-side trigger anomaly / exact cause
-undetermined** — it is explicitly **not** described as a confirmed GitHub
-bug, since the precise mechanism was not isolated.
+This run validated exactly the reviewed merged-`main` release commit,
+`eb043b4e9a62df8717399c9ab136fb722dc9bd0b`.
 
-### 2.5 Merged-main validation via `workflow_dispatch`
+An earlier version of this record stated that automatic push CI "did
+not materialize" and provisionally attributed this to a GitHub-side
+trigger anomaly. **That statement and that provisional conclusion are
+withdrawn.** The earlier CLI queries used to investigate this
+temporarily returned "no runs found" for the merge commit; later GitHub
+Actions history exposed the actual successful run above. This is
+recorded accurately as **delayed run visibility / an initially
+incomplete observation**, not as a confirmed or suspected GitHub trigger
+bug — no specific GitHub-internal cause is claimed for the earlier query
+gap.
 
-Because automatic push CI did not fire, merged-`main` was explicitly
-validated through CI's supported manual entry point:
+### 2.5 Additional explicit merged-main validation via `workflow_dispatch`
+
+In addition to the automatic push CI run confirmed in §2.4, merged-`main`
+was also explicitly validated through CI's manual entry point:
 
 | Field | Value |
 |---|---|
@@ -93,9 +108,10 @@ validated through CI's supported manual entry point:
 | Quality | PASS |
 | Release policy | PASS |
 
-This closes the evidentiary gap left by §2.4: the exact merged-`main`
-commit that was later tagged did receive a real, green, full CI run —
-just via `workflow_dispatch` rather than the anomalous `push` trigger.
+This run is **additional explicit validation** of the same
+merged-`main` commit — it does not close an evidentiary gap, since §2.4
+already establishes that the exact same commit received a real,
+automatic, green push-triggered CI run.
 
 ---
 
@@ -196,9 +212,98 @@ vulnerability-report-integrity failure of any kind.
 
 ---
 
-## 6. Post-release finding
+## 6. Post-release evidence-commit CI
 
-### DAY6-POST-M1 — Severity: Medium
+After this Day 6 evidence record was first committed
+(`09f04a99725216b07ef30b5dfc644a35d5bb4a37` — documentation/evidence
+only, added **after** the immutable `v0.6.0` release commit), automatic
+push CI ran against that evidence commit.
+
+| Field | Value |
+|---|---|
+| Run | `33059581018` |
+| Event | `push` |
+| Branch | `main` |
+| headSha | `09f04a99725216b07ef30b5dfc644a35d5bb4a37` |
+
+### 6.1 Attempt 1 — FAILURE
+
+| Field | Value |
+|---|---|
+| run_attempt | 1 |
+| Overall | FAILURE |
+| Quality | PASS |
+| Release policy | FAIL |
+
+Before the failure, the following completed successfully:
+
+- 622 unit tests passed
+- source lint passed
+- Dockerfile structural checks passed
+- Compose structural checks passed
+- workflow policy checks passed
+- build/security work progressed
+- reliability Scenario 1 completed successfully
+
+Scenario 1 proved (real Docker behavior, not simulated):
+
+- a real transient PID 1 OOM crash
+- exactly one automatic restart
+- `state` returned healthy
+- `app` readiness recovered
+- `gateway` readiness recovered
+- persisted state survived
+- a full `gateway -> app -> state` request succeeded after recovery
+
+Immediately afterward, Scenario 2 attempted:
+
+```
+docker update <state-container> --memory 6m --memory-swap 6m
+```
+
+Docker/runc returned:
+
+```
+runc did not terminate successfully:
+openat2 .../memory.max: no such file or directory
+```
+
+The reliability harness classified this error as non-retryable, and the
+release policy job failed as a direct result.
+
+The later `upload-artifact` warning that `artifacts/sbom` and
+`artifacts/security` were absent is downstream fallout from
+release-check terminating early — it is **not** a separate root cause.
+
+### 6.2 Attempt 2 — SUCCESS (single rerun)
+
+The failed run was rerun **once**, using GitHub's failed-job rerun
+mechanism, on the same Actions run and the same exact commit:
+
+| Field | Value |
+|---|---|
+| Run | `33059581018` (same run) |
+| run_attempt | 2 |
+| headSha | `09f04a99725216b07ef30b5dfc644a35d5bb4a37` (same commit) |
+| Overall | SUCCESS |
+| Quality | SUCCESS |
+| Release policy | SUCCESS |
+| Artifact | `ci-release-evidence-09f04a99725216b07ef30b5dfc644a35d5bb4a37` |
+
+No repository implementation changed between attempt 1 and attempt 2.
+Attempt 2 is **not** described as "fixing" the problem — nothing was
+fixed. The single successful rerun strengthens the evidence that
+attempt 1 was an environment-sensitive post-container-restart
+runc/cgroup-v2 synchronization race, of the same general class already
+documented in §2.1's second PR failure. It does **not** prove the
+reliability harness is sufficiently robust against this class of race —
+see DAY6-POST-M2 (§7.2) below.
+
+---
+
+## 7. Post-release findings
+
+### 7.1 DAY6-POST-M1 — Severity: Medium
 
 **Title**: `SHA256SUMS` uses CI workspace-relative paths instead of
 release asset basenames.
@@ -237,24 +342,79 @@ ships in.
    mirroring an actual GitHub Release download) passes
    `sha256sum -c SHA256SUMS` unmodified.
 
+### 7.2 DAY6-POST-M2 — Severity: Medium
+
+**Title**: Post-restart cgroup race classifier is narrower than observed
+GitHub runner failure variants.
+
+**Explanation**: Day 6 introduced bounded retry handling for a known
+runc/cgroup-v2 post-restart synchronization race. The classifier
+deliberately required a narrow signature involving:
+
+- a runc failure
+- `cgroup.controllers`
+- "no such file or directory"
+
+The post-release evidence-commit run (§6.1) exposed a closely related
+real GitHub runner variant involving:
+
+- a runc failure
+- `memory.max`
+- "no such file or directory"
+
+Because `memory.max` was not part of the accepted transient signature,
+the operation failed immediately rather than entering the bounded retry
+path.
+
+This is **not** evidence that arbitrary `docker update` errors should be
+retried, and it is **not** a runtime application failure. It is
+classified as reliability-test / runner-interaction hardening debt in
+the reliability harness's failure classifier.
+
+**Required Day 7 remediation** (must remain conservative):
+
+- recognize only strongly evidenced transient post-restart cgroup-v2
+  disappearance signatures
+- include observed controller/resource-file disappearance such as
+  `cgroup.controllers` and `memory.max` where safe
+- preserve bounded monotonic retry
+- preserve exact `HostConfig` post-update verification
+- unrelated runc/Docker errors must still fail immediately
+- retry deadline exhaustion must still fail
+- add deterministic unit tests for each accepted and rejected signature
+- add/retain real Docker reliability evidence
+
+**Disposition**: carried to Day 7 final hardening as DAY6-POST-M2, not
+fixed against `v0.6.0`.
+
 ---
 
-## 7. Existing carried Medium (preserved, not closed)
+## 8. Day 7 carried Medium items
 
-In addition to DAY6-POST-M1, the pre-existing, already-documented Day 6
-nonblocking Medium debt remains open and is preserved here unchanged:
+Three Medium items are carried into Day 7 final hardening:
 
-- `security/runtime-patches.lock` currently has no automated future
-  base/overlay drift tripwire to detect when a future Distroless base
-  refresh makes the security overlay redundant or conflicting (see
-  `docs/engineering-reviews/day-06-release-readiness.md` §16 item 1 and
-  `docs/engineering-reviews/day-06-workflow-security-review.md` §10).
+1. **Runtime-patch/base-overlay drift tripwire.**
+   `security/runtime-patches.lock` currently has no automated future
+   base/overlay drift tripwire to detect when a future Distroless base
+   refresh makes the security overlay redundant or conflicting (see
+   `docs/engineering-reviews/day-06-release-readiness.md` §16 item 1 and
+   `docs/engineering-reviews/day-06-workflow-security-review.md` §10).
 
-This item is **not** marked closed by this record.
+2. **`SHA256SUMS` consumer-path usability — DAY6-POST-M1 (§7.1).**
+   `SHA256SUMS` records CI workspace-relative paths rather than flat
+   release asset basenames. The hashes themselves were independently
+   verified correct (§5).
+
+3. **Post-restart cgroup race classifier coverage — DAY6-POST-M2
+   (§7.2).** The bounded retry classifier handles the known
+   `cgroup.controllers` race but does not cover the newly observed
+   closely related `memory.max` disappearance variant.
+
+None of these three items is marked closed by this record.
 
 ---
 
-## 8. Immutability
+## 9. Immutability
 
 **`v0.6.0` must remain immutable.** Specifically, this record does not,
 and future work must not, without explicit separate authorization:
@@ -265,13 +425,36 @@ and future work must not, without explicit separate authorization:
 - clobber any published `v0.6.0` release asset, or
 - silently rewrite the published `SHA256SUMS`.
 
-DAY6-POST-M1 (§6) is preserved as a **Day 7 remediation item**, applied
-to the *next* release's checksum generation — not as a retroactive edit
-to `v0.6.0`'s already-published assets.
+DAY6-POST-M1 (§7.1) and DAY6-POST-M2 (§7.2) are preserved as **Day 7
+remediation items**, applied to the *next* release's checksum generation
+and reliability-harness classifier respectively — not as retroactive
+edits to `v0.6.0`'s already-published assets or already-executed release
+automation.
+
+The post-release evidence-commit CI failure documented in §6.1 occurred
+on `09f04a99725216b07ef30b5dfc644a35d5bb4a37`, a documentation/evidence
+commit **after** the immutable `v0.6.0` release commit. It does not
+touch, retrigger, or invalidate the `v0.6.0` release itself.
 
 ---
 
-## 9. Final Day 6 status
+## 10. Final Day 6 status
+
+`v0.6.0` is not invalidated by the post-release evidence-commit CI
+failure in §6.1. The actual immutable release commit,
+`eb043b4e9a62df8717399c9ab136fb722dc9bd0b`, had:
+
+- successful final PR CI (§2.3),
+- successful automatic merged-main push CI, run `32990848068` (§2.4),
+- successful additional manual merged-main CI, run `33037379041` (§2.5),
+- successful pre-tag dry run, run `33037905027` (§3), and
+- successful tag-triggered release validation/publication, run
+  `33045245535` (§4).
+
+The later transient failure occurred on the separate
+documentation/evidence commit `09f04a99725216b07ef30b5dfc644a35d5bb4a37`
+(§6), added after the release commit — and that exact same commit passed
+on the single rerun (§6.2).
 
 | Item | Status |
 |---|---|
@@ -281,11 +464,14 @@ to `v0.6.0`'s already-published assets.
 | Pre-tag non-publication behavior | **VERIFIED** |
 | Remaining blocking issue for `v0.6.0` | **NONE** |
 
-Carried technical debt into Day 7:
+Carried Medium technical debt into Day 7 (three items — see §8 for
+detail):
 
-1. Runtime-patch/base-overlay drift detection — Medium (§7).
-2. `SHA256SUMS` consumer-path usability defect — DAY6-POST-M1, Medium
-   (§6).
+1. Runtime-patch/base-overlay drift tripwire (§8 item 1).
+2. `SHA256SUMS` consumer-path usability defect — DAY6-POST-M1 (§7.1 /
+   §8 item 2).
+3. Post-restart cgroup race classifier coverage — DAY6-POST-M2 (§7.2 /
+   §8 item 3).
 
 Day 6 is complete and may be frozen after this evidence is committed.
 
