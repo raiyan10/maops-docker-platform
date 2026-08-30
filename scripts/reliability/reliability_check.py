@@ -73,6 +73,7 @@ import http.client
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -477,8 +478,8 @@ def check_timeout_hierarchy_config(sc: ModuleType):
     )
 
 
-# --- Day 6 GitHub finding (run 32960673438): bounded, monotonic, VERIFIED
-# retry for `docker update` resource mutations --------------------------
+# --- Day 6/7 GitHub finding: bounded, monotonic, VERIFIED retry for
+# `docker update` resource mutations -------------------------------------
 #
 # GitHub run 32960673438 proved the docker-container Buildx portability fix
 # (docs/ci-cd.md) and then exercised the ENTIRE reliability harness
@@ -492,17 +493,40 @@ def check_timeout_hierarchy_config(sc: ModuleType):
 #   openat2 /sys/fs/cgroup/system.slice/docker-<id>.scope/cgroup.controllers:
 #   no such file or directory
 #
-# This is not reproducible against this project's own local Docker Desktop
-# install - it is treated as a GitHub-hosted-runner/runc/cgroup v2
-# post-restart synchronization race until proven otherwise (a container that
-# was just automatically restarted by the restart-policy engine can, on some
-# Linux runner cgroup v2 hierarchies, have a brief window where runc's own
-# cgroup.controllers bookkeeping for the new cgroup instance is not yet
-# fully settled when a `docker update` lands). The remediation below makes
-# `docker update` resource mutations robust to EXACTLY this narrow class of
-# error - never to Docker errors in general - and every eventual "success"
-# is independently re-verified via `docker inspect`, never inferred from
-# exit code alone.
+# Day 7 (DAY6-POST-M2, docs/engineering-reviews/day-06-post-release-
+# verification.md §7.2): a post-release evidence-commit CI run (run
+# 33059581018, attempt 1) hit a CLOSELY RELATED but distinct variant of the
+# exact same underlying race, this time against a different cgroup v2
+# resource-controller file:
+#
+#   Error response from daemon: Cannot update container <id>:
+#   runc did not terminate successfully: exit status 1:
+#   openat2 /sys/fs/cgroup/system.slice/docker-<id>.scope/memory.max:
+#   no such file or directory
+#
+# Both are treated as GitHub-hosted-runner/runc/cgroup-v2 post-restart
+# synchronization races until proven otherwise (a container that was just
+# automatically restarted by the restart-policy engine can, on some Linux
+# runner cgroup v2 hierarchies, have a brief window where runc's own
+# per-controller-file bookkeeping for the new cgroup instance is not yet
+# fully settled when a `docker update` lands) - NOT evidence that arbitrary
+# `docker update` failures, or arbitrary missing-file errors, should ever be
+# retried. The classifier below stays deliberately conservative: it
+# requires the runc-termination wrapper phrase, a real `openat2 <path>: no
+# such file or directory` failure (real ENOENT semantics, not merely the
+# words "no such file or directory" appearing anywhere in the message), AND
+# that the missing path both (a) lives under a real cgroup hierarchy
+# directory and (b) names one of a small, deliberately restricted,
+# explicitly enumerated set of cgroup v2 resource/controller files this
+# project has ACTUALLY observed disappear transiently - `cgroup.controllers`
+# and `memory.max` - never a broad "any cgroup-shaped filename" wildcard.
+# `pids.max`/`cpu.max`/`memory.swap.max`/anything else is deliberately NOT
+# accepted: it has never been observed, and accepting it on spec would widen
+# this from "hardened against two known real GitHub Actions failures" to
+# "retries most things that look vaguely like a cgroup file", which the Day
+# 7 hardening requirement explicitly forbids. Every eventual "success" is
+# independently re-verified via `docker inspect`, never inferred from exit
+# code alone.
 
 RESOURCE_UPDATE_RETRY_DEADLINE_SECONDS = 10.0
 RESOURCE_UPDATE_RETRY_INTERVAL_SECONDS = 0.5
@@ -523,24 +547,57 @@ def _docker_memory_string_to_bytes(value: str) -> int:
     return int(text)
 
 
+# The ONLY cgroup v2 resource/controller filenames this classifier accepts
+# as evidence of the known transient post-restart race - deliberately
+# narrow (see the block comment above). Extending this set requires a new,
+# independently observed real GitHub Actions failure, not speculation.
+_TRANSIENT_CGROUP_RACE_ACCEPTED_FILENAMES = frozenset({"cgroup.controllers", "memory.max"})
+
+# Matches the real `openat2 <path>: no such file or directory` fragment
+# Docker/runc emit for this class of error - requires the literal ENOENT
+# wording, not merely its rough presence anywhere in the message.
+_OPENAT2_ENOENT_PATTERN = re.compile(r"openat2\s+(?P<path>\S+):\s*no such file or directory", re.IGNORECASE)
+
+
 def _is_transient_cgroup_update_race(stderr: str) -> bool:
-    """Narrow classifier for the EXACT class of error GitHub run 32960673438
-    hit. Deliberately requires ALL THREE fragments together - a bare
-    "no such file or directory" is common to many unrelated, genuinely
-    non-retryable Docker/runc errors (a missing binary, a bad bind mount, a
-    typo'd path) and must never by itself be treated as retryable; nor
-    should "cgroup.controllers" or "runc did not terminate successfully"
-    alone. This intentionally does NOT match "permission denied", "invalid
-    memory limit", "invalid argument", "container not found", "Cannot
-    connect to the Docker daemon", or an unknown-flag/CLI-syntax error -
-    all of those fail immediately, exactly as a real, non-transient error
-    should."""
+    """Conservative classifier covering exactly the class of error GitHub
+    runs 32960673438 and 33059581018 hit. ALL of the following must hold:
+
+      1. the runc-termination wrapper phrase "runc did not terminate
+         successfully" is present (proves this is a real runc failure, not
+         merely an unrelated message that happens to mention a cgroup file);
+      2. a genuine `openat2 <path>: no such file or directory` fragment is
+         present (real ENOENT-on-openat2 semantics - a bare "no such file
+         or directory" elsewhere in the message, with no openat2 syscall
+         context, is common to many unrelated, genuinely non-retryable
+         Docker/runc errors and is never by itself sufficient);
+      3. the missing path's own directory component contains `/cgroup/`
+         (real cgroup-hierarchy context - a `memory.max`/`cgroup.controllers`
+         reference OUTSIDE a cgroup path is not this race); and
+      4. the missing path's basename is one of
+         `_TRANSIENT_CGROUP_RACE_ACCEPTED_FILENAMES` - deliberately NOT any
+         other cgroup-shaped filename.
+
+    This intentionally does NOT match "permission denied", "invalid memory
+    limit", "invalid argument", "container not found", "Cannot connect to
+    the Docker daemon", an unknown-flag/CLI-syntax error, or a missing file
+    that merely happens to be named `memory.max`/`cgroup.controllers`
+    somewhere outside a real cgroup path - all of those fail immediately,
+    exactly as a real, non-transient error should."""
     text = stderr or ""
-    return (
-        "runc did not terminate successfully" in text
-        and "cgroup.controllers" in text
-        and "no such file or directory" in text.lower()
-    )
+    if "runc did not terminate successfully" not in text:
+        return False
+
+    match = _OPENAT2_ENOENT_PATTERN.search(text)
+    if match is None:
+        return False
+
+    path = match.group("path")
+    if "/cgroup/" not in path:
+        return False
+
+    filename = path.rsplit("/", 1)[-1]
+    return filename in _TRANSIENT_CGROUP_RACE_ACCEPTED_FILENAMES
 
 
 def _inspect_host_config(sc: ModuleType, container: str, context: str) -> dict:
@@ -750,6 +807,31 @@ def with_memory_shrink_restored(
     return action_result
 
 
+# Day 7 (DAY7-REL-M1, day-07-reliability-adversarial-review.md): a real
+# `docker unpause` can transiently fail (daemon load, a Docker Desktop
+# network blip, etc.). Previously, `state_is_paused` was cleared
+# unconditionally right after the attempt regardless of its outcome - which
+# meant the OUTER teardown `finally` (which only re-attempts an unpause
+# `if state_is_paused:`) would never get a second try, and `compose down
+# -t 10 -v` could run against a container that is still genuinely paused.
+# Extracted as its own function (rather than left inline in `main()`) so
+# this VERIFIED-success-only transition is Docker-free unit-testable -
+# `main()` itself is not (it drives a real Compose stack end to end).
+def _unpause_state_container(sc: ModuleType, container: str) -> bool:
+    """Attempts a real `docker unpause` and returns whether it VERIFIABLY
+    succeeded (`returncode == 0`) - never inferred any other way. A caller
+    must only clear its own `state_is_paused` flag when this returns
+    `True`; on `False`, the flag must be left `True` so a later teardown
+    step gets a chance to retry before `compose down -v` runs. Never
+    swallows the failure - prints the same WARNING to stderr as before this
+    fix on any failed attempt, and never raises on its own."""
+    unpause_result = sc.run_docker(["unpause", container])
+    if unpause_result.returncode == 0:
+        return True
+    print(f"reliability_check: WARNING: docker unpause {container} failed: {unpause_result.stderr.strip()}", file=sys.stderr)
+    return False
+
+
 def main() -> int:
     _install_sigterm_handler()
 
@@ -886,10 +968,8 @@ def main() -> int:
             print(f"reliability_check: A-6 closed - state-dependent request through gateway->app->state completed in {state_request_elapsed:.2f}s (inner={inner_timeout}s, outer={outer_timeout}s, safety_margin={gateway_cfg.timeout_safety_margin_seconds}s)")
 
         finally:
-            unpause_result = sc.run_docker(["unpause", state_container])
-            state_is_paused = False
-            if unpause_result.returncode != 0:
-                print(f"reliability_check: WARNING: docker unpause {state_container} failed: {unpause_result.stderr.strip()}", file=sys.stderr)
+            if _unpause_state_container(sc, state_container):
+                state_is_paused = False
 
         state_healthy_again = sc.check_runtime_healthy(state_container)
         results.append(state_healthy_again)

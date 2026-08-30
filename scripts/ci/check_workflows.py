@@ -42,7 +42,11 @@ loudly rather than appearing "skipped"), invoked with explicit
 dry-run contract is enforced by that script, not merely by this YAML) and
 before `make release-check` (fail fast on an invalid ref/tag/event, not
 after several minutes of build work); no registry-publication command
-appears; no Day 7+ tooling reference appears.
+appears; no Day 7+ tooling reference appears; the `publish` job's
+`gh release create` step is guarded by an earlier existing-release check
+(`gh release view "$TAG" ... ` failing the job on a hit) and never
+invoked with `--clobber` anywhere in either file (Day 7,
+DAY7-RELENG-L1 - see docs/engineering-reviews/day-07-release-engineering-review.md).
 """
 
 from __future__ import annotations
@@ -538,6 +542,73 @@ def check_release_context_validation_is_authoritative(texts: dict[str, str]) -> 
     return findings
 
 
+def check_no_release_clobber(texts: dict[str, str]) -> list[Finding]:
+    """Closes DAY7-RELENG-L1 (day-07-release-engineering-review.md): the
+    `publish` job's existing-release guard (`gh release view "$TAG" ...`,
+    failing the job when a release for the tag already exists) prevents a
+    re-run from silently overwriting an already-published release's
+    evidence - a real safety invariant that, until now, was proven only by
+    a human reading `release.yml`'s source. Scoped strictly to the
+    `publish` job: a `gh release view`/guard-shaped step appearing
+    anywhere else in either file (e.g. the `validate` job) does not
+    satisfy this - a guard outside `publish` protects nothing, since only
+    `publish` ever runs `gh release create`. Requires, in order:
+
+    - `gh release create` is never invoked with `--clobber` anywhere in
+      either workflow file (checked file-wide, since a clobber flag would
+      be equally dangerous regardless of which step/job introduced it);
+    - the `publish` job contains a step that both queries for an existing
+      release (`gh release view`) AND fails the job when one is found (an
+      `exit <nonzero>` in that same step) - merely mentioning
+      `gh release view` without acting on the result does not count as a
+      guard;
+    - that guard step runs strictly BEFORE the `gh release create` step,
+      never after (a guard placed after publication has already happened
+      protects nothing).
+    """
+    findings: list[Finding] = []
+    for name, text in texts.items():
+        if "--clobber" in text:
+            findings.append(Finding(f"{name}: 'gh release create' must never be invoked with '--clobber'"))
+
+    text = texts.get("release.yml")
+    if text is None:
+        return findings
+    block = job_block(text, "publish")
+    if not block:
+        findings.append(Finding("release.yml: no 'publish' job found to verify the existing-release guard"))
+        return findings
+
+    steps = list_items(nested_block(block, "steps"))
+    step_texts = ["\n".join(step) for step in steps]
+
+    create_idx = next((i for i, s in enumerate(step_texts) if "gh release create" in s), None)
+    if create_idx is None:
+        findings.append(Finding("release.yml: 'publish' job does not run 'gh release create'"))
+        return findings
+
+    guard_idx = next(
+        (i for i, s in enumerate(step_texts) if "gh release view" in s and re.search(r"exit\s+[1-9]", s)),
+        None,
+    )
+    if guard_idx is None:
+        findings.append(
+            Finding(
+                "release.yml: 'publish' job must guard 'gh release create' with a pre-existing "
+                "existing-release check ('gh release view \"$TAG\" ...' failing the job on a hit) "
+                "before ever creating the release"
+            )
+        )
+    elif guard_idx >= create_idx:
+        findings.append(
+            Finding(
+                "release.yml: the existing-release guard step must run BEFORE 'gh release create', "
+                "not after"
+            )
+        )
+    return findings
+
+
 def check_no_registry_publication(texts: dict[str, str]) -> list[Finding]:
     findings = []
     for name, text in texts.items():
@@ -569,6 +640,7 @@ CHECKS = [
     check_required_triggers,
     check_buildx_container_builder_before_release_check,
     check_release_context_validation_is_authoritative,
+    check_no_release_clobber,
     check_no_registry_publication,
     check_no_day7_plus_tooling,
 ]

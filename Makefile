@@ -23,7 +23,7 @@ export VERSION
 .PHONY: help test lint dockerfile-check compose-check workflow-check quality \
 	build inspect image-audit smoke security-check compose-test \
 	reliability-check reproducibility-check sbom sbom-check vuln-scan \
-	supply-chain-check release-check clean
+	supply-chain-check patch-lifecycle-check release-bundle release-check clean
 
 help:
 	@echo "Available targets:"
@@ -49,9 +49,13 @@ help:
 	@echo "  vuln-scan            Generate a Trivy JSON report + enforce vulnerability policy"
 	@echo "  supply-chain-check   sbom + sbom-check + vuln-scan"
 	@echo ""
+	@echo "  patch-lifecycle-check  Runtime security-patch (security/runtime-patches.lock) lifecycle proof"
+	@echo "  release-bundle       Stage the flat, consumer-verifiable release bundle + verify sha256sum -c"
+	@echo ""
 	@echo "  release-check        quality + build + inspect + image-audit + smoke +"
 	@echo "                       security-check + compose-test + reliability-check +"
-	@echo "                       reproducibility-check + supply-chain-check"
+	@echo "                       reproducibility-check + supply-chain-check +"
+	@echo "                       patch-lifecycle-check + release-bundle"
 	@echo "  clean                Remove known project-owned generated resources"
 	@echo ""
 	@echo "Image tag is derived from VERSION: $(IMAGE)"
@@ -121,16 +125,33 @@ vuln-scan:
 supply-chain-check: sbom sbom-check vuln-scan
 	@echo "supply-chain-check: sbom + sbom-check + vuln-scan all passed"
 
-# The single authoritative local release-policy contract (Day 6): a
+# Day 7: proves security/runtime-patches.lock's emergency libssl3t64
+# overlay is still REQUIRED against the REAL pinned Distroless final base
+# (independently pulled + inspected - never a duplicated constant) -
+# see scripts/security/patch_lifecycle_check.py and docs/build-security.md
+# "Runtime security-patch lifecycle".
+patch-lifecycle-check:
+	$(PYTHON) scripts/security/patch_lifecycle_check.py
+
+# Day 7 (closes DAY6-POST-M1): stages the flat, consumer-shaped release
+# bundle from the local artifacts/ tree (sbom + vulnerability report) and
+# independently proves the real, unmodified `sha256sum -c SHA256SUMS`
+# succeeds against it - see scripts/release/prepare_release_bundle.py.
+# Depends implicitly on supply-chain-check having already populated
+# artifacts/sbom/ and artifacts/security/ earlier in release-check.
+release-bundle:
+	$(PYTHON) scripts/release/prepare_release_bundle.py --source-dir artifacts --out release-bundle
+
+# The single authoritative local release-policy contract (Day 6/7): a
 # developer running this locally, and GitHub Actions' release-policy job
 # (.github/workflows/ci.yml), exercise the identical target - CI
 # orchestrates this Makefile rather than hand-listing the same gate list a
 # second time. Depends on supply-chain-check (not sbom/sbom-check/vuln-scan
 # individually) so the SBOM/vulnerability policy is genuinely part of the
-# authoritative chain without duplicating its own three-step definition.
-release-check: quality build inspect image-audit smoke security-check compose-test reliability-check reproducibility-check supply-chain-check
-	@echo "=== docker compose config ==="
-	docker compose config
+# authoritative chain without duplicating its own three-step definition;
+# release-bundle runs after supply-chain-check for the same reason (it
+# consumes supply-chain-check's own output).
+release-check: quality build inspect image-audit smoke security-check compose-test reliability-check reproducibility-check supply-chain-check patch-lifecycle-check release-bundle
 
 clean:
 	find . -type d -name '__pycache__' -not -path './.git/*' -exec rm -rf {} +

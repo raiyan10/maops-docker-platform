@@ -376,7 +376,72 @@ runtime plane — see `docs/ci-cd.md` for the full design.
   `docs/supply-chain.md`. The Distroless base digest and the runtime
   topology above are both unchanged.
 
-## Day 7 — Hardening, reviews, showcase -> v1.0.0 (planned)
+## Day 7 — Hardening, reviews, showcase -> v1.0.0 (implemented)
 
-Final security/architecture review pass across the full seven-day build,
-portfolio-facing documentation, and the `v1.0.0` tag/release.
+Final hardening and production-readiness pass across the full seven-day
+build — no runtime redesign: the same three services, one image, two
+networks, one named volume, and hardening properties Days 1-6 already
+established. `VERSION` bumped `0.6.0` -> `1.0.0`. See
+`docs/production-readiness.md` (the implementation-time debt ledger and
+the final production-readiness contract) and
+`docs/releases/v1.0.0.md` (release-candidate notes — this is
+release-*candidate* preparation; the `v1.0.0` tag/GitHub Release
+themselves follow only after independent review, exactly as `v0.6.0`
+did).
+
+Three Day-6-carried Medium findings closed:
+
+- **Runtime security-patch lifecycle** (`scripts/security/
+  patch_lifecycle_check.py`, `make patch-lifecycle-check`) — a real
+  tripwire that independently `docker pull`s the exact pinned Distroless
+  final base (derived from `docker/app/Dockerfile`'s own FROM text via
+  `scripts/security/base_image_ref.py`, never a duplicated digest
+  constant) and inspects its real, currently-shipped `libssl3t64`
+  version against `security/runtime-patches.lock`'s own recorded
+  vulnerable/patched versions, using genuine Debian version-comparison
+  semantics (`scripts/security/debian_version.py`). Distinguishes
+  "overlay still required", "overlay now redundant" (fails loudly rather
+  than silently continuing to trust a stale overlay), "evidence could not
+  be established" (fails rather than assuming), and "the lock's own
+  recorded rationale has drifted from reality" (fails, prompting a lock
+  update) — four real, independently testable outcomes, not a tautology.
+  Integrated into `make release-check`.
+- **Release-consumer `SHA256SUMS` layout** (`scripts/release/
+  prepare_release_bundle.py`, `make release-bundle`, DAY6-POST-M1) — the
+  real `v0.6.0` release shipped a `SHA256SUMS` referencing CI
+  workspace-relative paths (`release-evidence/sbom/...`), which a
+  consumer downloading the flat GitHub Release assets could not verify
+  with an unmodified `sha256sum -c SHA256SUMS`. This script stages a
+  flat, basename-only bundle and independently proves the real,
+  unmodified command succeeds against it — with real, discriminating
+  tests for a missing/renamed/tampered asset, a duplicate basename, and a
+  hand-tampered manifest referencing a path-traversal/nested-CI-path
+  entry. `release.yml`'s `publish` job now attaches `release-bundle/*`
+  verbatim instead of re-deriving checksums inline.
+- **Post-restart cgroup-v2 race classifier** (`scripts/reliability/
+  reliability_check.py::_is_transient_cgroup_update_race`, DAY6-POST-M2)
+  — hardened, conservatively, to also accept the newly evidenced
+  `memory.max` disappearance variant (GitHub run `33059581018`) alongside
+  the original `cgroup.controllers` variant (GitHub run `32960673438`),
+  via a deliberately narrow, explicitly enumerated accepted-filename set
+  plus a real `openat2 <path>: no such file or directory` match requiring
+  genuine cgroup-hierarchy path context — never a broad "any
+  cgroup-shaped filename" wildcard. Unrelated missing files, unrelated
+  runc failures, permission/daemon/argument errors, and the bounded
+  monotonic retry deadline are all unchanged.
+
+Also materially closed, in the same session, a still-open Day 4 finding
+this Day 7 scope's own "historical debt sweep" directive named
+explicitly: `scripts/build/image_audit.py`'s `check_final_base_is_
+approved_distroless` was partially tautological (it only asserted the
+built image's `RootFS` was inspectable and non-empty, never actually
+comparing it against anything). It now independently `docker pull`s the
+same pinned base `patch_lifecycle_check.py` derives, and asserts that
+base's own `RootFS.Layers` is a genuine ordered prefix of the built
+release image's own layers — real evidence, with new Docker-free unit
+coverage (`tests/test_image_audit.py`) the function never had before.
+
+See `docs/production-readiness.md` for the full implementation-time debt
+ledger (every other historical Low/Medium finding, adjudicated CLOSED /
+ACCEPTED / SUPERSEDED / OUT OF SCOPE) and the final production-readiness
+contract `make release-check` now composes end to end.

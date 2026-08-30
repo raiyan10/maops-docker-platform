@@ -67,8 +67,13 @@ PYTHON_BIN = "/usr/bin/python3.13"
 EXPECTED_ENTRYPOINT = [PYTHON_BIN]
 EXPECTED_DEFAULT_CMD = ["-m", "app"]
 
-EXPECTED_FINAL_BASE_DIGEST = "sha256:4376456c1d8520c9d464f2c475465850efaecabf9a190ff24d4a0eef2b884bea"
-EXPECTED_FINAL_BASE_REPO = "gcr.io/distroless/python3-debian13"
+# Day 7: the pinned final base (repository, digest) is no longer a second
+# hand-copied constant here - it is derived at runtime from
+# docker/app/Dockerfile's own FROM text (see load_base_image_ref() /
+# check_final_base_is_approved_distroless() below), so this script cannot
+# silently drift out of sync with what the Dockerfile actually says, and
+# its cross-check against the real base image is genuine evidence rather
+# than one constant compared against another.
 
 # Filename-shaped secret/key-material detection only (no content grep) -
 # matches this project's "honestly scoped" convention (see
@@ -106,6 +111,15 @@ def load_dockerfile_checker() -> ModuleType:
 def load_runtime_patch_lock() -> ModuleType:
     path = REPO_ROOT / "scripts" / "security" / "runtime_patch_lock.py"
     spec = importlib.util.spec_from_file_location("runtime_patch_lock_for_image_audit", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_base_image_ref() -> ModuleType:
+    path = REPO_ROOT / "scripts" / "security" / "base_image_ref.py"
+    spec = importlib.util.spec_from_file_location("base_image_ref_for_image_audit", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -393,19 +407,55 @@ def check_no_world_writable_source(container_name: str):
 # --- Day 4 Distroless-specific checks ---
 
 
-def check_final_base_is_approved_distroless(image: str):
-    """[B] cross-checks docker/app/Dockerfile's own approved-digest pin
-    (scripts/lint/check_dockerfile.py's EXPECTED_FINAL_BASE_DIGEST) against
-    what the built image's RootFS actually resolves to via
-    `docker image inspect`. Proves the release image was really built
-    FROM the approved Distroless digest, not merely that the Dockerfile
-    text claims it was."""
-    result = run_docker(["image", "inspect", image, "--format", "{{json .RootFS.Layers}}"])
-    passed = result.returncode == 0 and result.stdout.strip() != ""
+def check_final_base_is_approved_distroless(image: str, base_repo: str, base_digest: str):
+    """[B] REAL cross-check (Day 7 - closes a Day 4 finding that this
+    check was partially tautological): independently `docker pull`s the
+    EXACT pinned final-base digest (derived from docker/app/Dockerfile's
+    own FROM text via scripts/security/base_image_ref.py - never a second
+    hand-copied constant), inspects that base image's own
+    `RootFS.Layers`, and asserts it is a genuine ordered PREFIX of the
+    built release image's own `RootFS.Layers`. This proves the release
+    image's actual on-disk layer content really was built FROM those
+    exact base layers - not merely that the Dockerfile text says so, and
+    not merely that `docker image inspect` on the release image itself
+    succeeds and returns something non-empty (the prior version of this
+    check only asserted that much, which could never fail even if the
+    base were wrong)."""
+    base_ref = f"{base_repo}@{base_digest}"
+
+    pull_result = run_docker(["pull", base_ref], timeout=180.0)
+    if pull_result.returncode != 0:
+        return AuditResult(
+            f"pinned final base {base_ref} is independently pullable (real cross-check evidence source)",
+            False,
+            f"docker pull failed: {pull_result.stderr.strip()}",
+        )
+
+    base_layers_result = run_docker(["image", "inspect", base_ref, "--format", "{{json .RootFS.Layers}}"])
+    image_layers_result = run_docker(["image", "inspect", image, "--format", "{{json .RootFS.Layers}}"])
+    if base_layers_result.returncode != 0 or image_layers_result.returncode != 0:
+        return AuditResult(
+            f"built image RootFS genuinely begins with the pinned base {base_ref}'s exact layer set",
+            False,
+            f"docker image inspect failed: base={base_layers_result.stderr.strip()!r} "
+            f"image={image_layers_result.stderr.strip()!r}",
+        )
+
+    try:
+        base_layers = json.loads(base_layers_result.stdout)
+        image_layers = json.loads(image_layers_result.stdout)
+    except json.JSONDecodeError as exc:
+        return AuditResult(
+            f"built image RootFS genuinely begins with the pinned base {base_ref}'s exact layer set",
+            False,
+            f"non-JSON RootFS.Layers output: {exc}",
+        )
+
+    passed = bool(base_layers) and image_layers[: len(base_layers)] == base_layers
     return AuditResult(
-        "image RootFS is inspectable (base-layer presence sanity check)",
+        f"built image RootFS genuinely begins with the pinned base {base_ref}'s exact layer set",
         passed,
-        result.stdout.strip() if passed else result.stderr.strip(),
+        f"base_layer_count={len(base_layers)} image_layer_count={len(image_layers)} prefix_match={passed}",
     )
 
 
@@ -589,6 +639,7 @@ def main() -> int:
 
     sc = load_security_checker()
     lock = load_runtime_patch_lock().load_runtime_patch_lock()
+    base_repo, base_digest = load_base_image_ref().get_final_stage_base_ref()
     version = read_version()
     image = f"maops-docker-platform:{version}"
     container_name = f"maops-image-audit-{uuid.uuid4().hex[:12]}"
@@ -603,7 +654,7 @@ def main() -> int:
     results.append(sc.check_image_labels(image, version))
     results.append(check_entrypoint_and_default_cmd(sc, image))
     results.append(check_oci_source_truthful(sc, image))
-    results.append(check_final_base_is_approved_distroless(image))
+    results.append(check_final_base_is_approved_distroless(image, base_repo, base_digest))
 
     try:
         start_container(image, container_name)

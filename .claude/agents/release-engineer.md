@@ -42,12 +42,26 @@ Review the project for release readiness:
   explanation for any discrepancy between `docker image ls` and `docker
   history` totals.
 - **Release-check composition**: `make release-check` actually encodes
-  `quality (test -> lint -> dockerfile-check -> compose-check) -> build
-  -> inspect -> image-audit -> smoke -> security-check -> compose-test ->
-  reliability-check -> reproducibility-check -> sbom -> sbom-check ->
-  vuln-scan` as a real dependency chain in the Makefile (not just
-  documented informally), and every step's failure propagates (no
-  swallowed exit code). `compose-test`
+  `quality (test -> lint -> dockerfile-check -> compose-check ->
+  workflow-check) -> build -> inspect -> image-audit -> smoke ->
+  security-check -> compose-test -> reliability-check ->
+  reproducibility-check -> supply-chain-check (sbom -> sbom-check ->
+  vuln-scan) -> patch-lifecycle-check -> release-bundle` as a real
+  dependency chain in the Makefile (not just documented informally), and
+  every step's failure propagates (no swallowed exit code).
+  `patch-lifecycle-check` (Day 7, `scripts/security/patch_lifecycle_check.py`)
+  must derive the pinned final base image from `docker/app/Dockerfile`'s
+  own FROM text (never a duplicated digest constant) and independently
+  pull/inspect that exact base to prove `security/runtime-patches.lock`'s
+  emergency overlay is still required — verify it actually distinguishes
+  "still required" from "now redundant" rather than always passing.
+  `release-bundle` (Day 7, `scripts/release/prepare_release_bundle.py`)
+  must stage a flat, basename-only bundle and independently prove the
+  real, unmodified `sha256sum -c SHA256SUMS` succeeds against it — this
+  is what closes DAY6-POST-M1 (see
+  `docs/engineering-reviews/day-06-post-release-verification.md`); verify
+  `release.yml`'s `publish` job attaches `release-bundle/*` rather than
+  re-deriving checksums inline. `compose-test`
   (`scripts/compose/compose_integration.py`) must perform real Compose
   runtime verification of all three services — a step that only runs
   `docker compose config` is not sufficient and would silently reopen Day
@@ -95,13 +109,17 @@ Review the project for release readiness:
   genuinely unfixed blocking finding should make `vuln-scan`/
   `release-check` fail, not pass via a silently added `.trivyignore` or
   loosened policy threshold.
-- **No premature publishing beyond Day 6's own scope**: no GHCR/Docker Hub
-  configuration, no registry credentials, no `v1.0.0` tag or release —
-  confirm nothing in the repository asserts otherwise. Day 6 is genuinely
-  allowed to add GitHub Actions CI and a controlled, tag-triggered GitHub
-  Release workflow (see below) — do not flag that as premature; do flag
-  any registry-publish step, any Day 7+ tooling (Cosign, SLSA, Kubernetes),
-  or any tag/release beyond `v0.6.0` as out of scope.
+- **No premature publishing beyond Day 7's own scope**: no GHCR/Docker Hub
+  configuration, no registry credentials — confirm nothing in the
+  repository asserts otherwise. Day 7 (`VERSION` = `1.0.0`,
+  `docs/releases/v1.0.0.md`) is genuinely release-*candidate* preparation
+  only — the `v1.0.0` Git tag and GitHub Release are NOT created as part
+  of this scope (they follow, after independent review, exactly the same
+  controlled tag-triggered `release.yml` path `v0.6.0` used) — do not
+  flag the version bump/release-notes work itself as premature; do flag
+  any registry-publish step, any Day 7+ tooling (Cosign, SLSA,
+  Kubernetes), or an actual `v1.0.0` tag/GitHub Release having already
+  been created as out of scope.
 - **CI/CD workflow ownership (Day 6)**: `.github/workflows/ci.yml` and
   `.github/workflows/release.yml` are this agent's own domain, along with
   `scripts/ci/check_workflows.py` (`make workflow-check`) and

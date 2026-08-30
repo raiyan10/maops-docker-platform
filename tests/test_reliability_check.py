@@ -37,6 +37,20 @@ GITHUB_RUN_32960673438_TRANSIENT_STDERR = (
     "no such file or directory"
 )
 
+# Day 7 (DAY6-POST-M2): the real GitHub run 33059581018 (attempt 1, a
+# post-release evidence-commit CI run, immediately after a genuine
+# Scenario-1 OOM crash and automatic restart) hit a closely related but
+# distinct variant of the same underlying post-restart runc/cgroup-v2
+# synchronization race - `memory.max`, not `cgroup.controllers`.
+GITHUB_RUN_33059581018_TRANSIENT_STDERR = (
+    "Error response from daemon: Cannot update container "
+    "7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b: "
+    "runc did not terminate successfully: exit status 1: "
+    "openat2 /sys/fs/cgroup/system.slice/"
+    "docker-7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b.scope/memory.max: "
+    "no such file or directory"
+)
+
 
 def load_reliability_check() -> ModuleType:
     path = REPO_ROOT / "scripts" / "reliability" / "reliability_check.py"
@@ -267,6 +281,43 @@ class TransientCgroupUpdateRaceClassifierTests(unittest.TestCase):
     def test_real_github_run_32960673438_error_is_classified_as_transient(self) -> None:
         self.assertTrue(self.module._is_transient_cgroup_update_race(GITHUB_RUN_32960673438_TRANSIENT_STDERR))
 
+    def test_real_github_run_33059581018_memory_max_error_is_classified_as_transient(self) -> None:
+        """Day 7 (DAY6-POST-M2): the newly evidenced `memory.max`
+        disappearance variant must now be accepted, alongside the
+        original `cgroup.controllers` variant - not instead of it."""
+        self.assertTrue(self.module._is_transient_cgroup_update_race(GITHUB_RUN_33059581018_TRANSIENT_STDERR))
+
+    def test_unrelated_cgroup_controller_filename_is_deliberately_not_transient(self) -> None:
+        """The accepted filename set is DELIBERATELY narrow - `pids.max`
+        has never been observed to disappear transiently in this
+        project's real CI evidence, and accepting it on spec (rather than
+        on evidence) is exactly the "any cgroup-shaped filename" wildcard
+        the Day 7 hardening requirement forbids, even though the rest of
+        the error shape (runc phrase, openat2, real cgroup path context)
+        is otherwise identical to an accepted variant."""
+        stderr = GITHUB_RUN_32960673438_TRANSIENT_STDERR.replace("cgroup.controllers", "pids.max")
+        self.assertFalse(self.module._is_transient_cgroup_update_race(stderr))
+
+    def test_memory_max_outside_a_real_cgroup_path_is_not_transient(self) -> None:
+        """An accepted FILENAME outside a real cgroup hierarchy path is
+        not evidence of this race - the path context is required, not
+        just the basename."""
+        stderr = (
+            "Error response from daemon: runc did not terminate successfully: exit status 1: "
+            "openat2 /var/lib/docker/containers/abc123/memory.max: no such file or directory"
+        )
+        self.assertFalse(self.module._is_transient_cgroup_update_race(stderr))
+
+    def test_openat2_without_enoent_wording_is_not_transient(self) -> None:
+        """A real openat2 failure against an accepted cgroup filename that
+        is NOT "no such file or directory" (e.g. a permissions problem)
+        must never be treated as this transient race."""
+        stderr = (
+            "Error response from daemon: runc did not terminate successfully: exit status 1: "
+            "openat2 /sys/fs/cgroup/system.slice/docker-abc.scope/memory.max: permission denied"
+        )
+        self.assertFalse(self.module._is_transient_cgroup_update_race(stderr))
+
     def test_generic_no_such_file_or_directory_is_not_transient(self) -> None:
         self.assertFalse(self.module._is_transient_cgroup_update_race(
             "Error response from daemon: OCI runtime exec failed: exec failed: "
@@ -376,6 +427,20 @@ class UpdateContainerResourcesVerifiedTests(unittest.TestCase):
     def test_github_transient_error_then_success_retries_and_verifies(self) -> None:
         sc, calls = self._scripted_sc([
             self._ok(returncode=1, stderr=GITHUB_RUN_32960673438_TRANSIENT_STDERR),
+            self._inspect_ok(134217728, -1),  # retry check: still old values
+            self._ok(returncode=0),
+            self._inspect_ok(6291456, 6291456),
+        ])
+        now, sleep = self._fake_clock()
+        result = self.module.update_container_resources_verified(sc, "c", "6m", "6m", now=now, sleep=sleep)
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(len(calls), 4)
+
+    # B2: the newly evidenced memory.max transient variant retries and
+    # verifies exactly like the original cgroup.controllers variant.
+    def test_memory_max_transient_error_then_success_retries_and_verifies(self) -> None:
+        sc, calls = self._scripted_sc([
+            self._ok(returncode=1, stderr=GITHUB_RUN_33059581018_TRANSIENT_STDERR),
             self._inspect_ok(134217728, -1),  # retry check: still old values
             self._ok(returncode=0),
             self._inspect_ok(6291456, 6291456),
@@ -767,6 +832,116 @@ class CheckTimeoutHierarchyConfigTests(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertIn("state_dependency_timeout_seconds", result.detail)
         self.assertIn("gateway_upstream_timeout_seconds", result.detail)
+
+
+class UnpauseStateContainerTests(unittest.TestCase):
+    """Day 7 (DAY7-REL-M1, day-07-reliability-adversarial-review.md): a
+    failed first `docker unpause` must not be silently masked as though it
+    had cleared `state_is_paused` - the outer teardown `finally` only
+    re-attempts an unpause `if state_is_paused:`, so a caller must only
+    clear that flag on a VERIFIED successful unpause (`_unpause_state_
+    container` returning `True`), leaving it `True` on failure so the
+    outer teardown gets a second attempt before `compose down -v` runs
+    against a possibly still-paused container."""
+
+    def setUp(self) -> None:
+        self.module = load_reliability_check()
+
+    @staticmethod
+    def _scripted_sc(responses: list[SimpleNamespace]) -> tuple[SimpleNamespace, list]:
+        sc = _fake_sc()
+        calls: list[list[str]] = []
+        queue = list(responses)
+
+        def fake_run_docker(args, timeout=20.0):
+            calls.append(list(args))
+            if not queue:
+                raise AssertionError(f"unexpected extra run_docker call: {args}")
+            return queue.pop(0)
+
+        sc.run_docker = fake_run_docker
+        return sc, calls
+
+    @staticmethod
+    def _ok(returncode: int = 0, stderr: str = "") -> SimpleNamespace:
+        return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+
+    # A: successful first unpause clears state_is_paused.
+    def test_successful_unpause_returns_true(self) -> None:
+        sc, calls = self._scripted_sc([self._ok(returncode=0)])
+        succeeded = self.module._unpause_state_container(sc, "c")
+        self.assertTrue(succeeded)
+        self.assertEqual(calls, [["unpause", "c"]])
+
+        # Mirrors main()'s own inner `finally` block exactly: only a
+        # verified-successful unpause clears the flag.
+        state_is_paused = True
+        if succeeded:
+            state_is_paused = False
+        self.assertFalse(state_is_paused)
+
+    # B: failed first unpause leaves cleanup responsible for retrying -
+    # the flag must NOT be cleared on a failed attempt.
+    def test_failed_unpause_returns_false_and_does_not_clear_flag(self) -> None:
+        sc, calls = self._scripted_sc([self._ok(returncode=1, stderr="daemon busy")])
+        succeeded = self.module._unpause_state_container(sc, "c")
+        self.assertFalse(succeeded)
+        self.assertEqual(calls, [["unpause", "c"]])
+
+        state_is_paused = True
+        if succeeded:
+            state_is_paused = False
+        self.assertTrue(state_is_paused, "state_is_paused must stay True after a failed unpause")
+
+    # C: the outer cleanup actually attempts a second unpause after the
+    # first failure - composes the inner finally (this fix) and the outer
+    # teardown's own `if state_is_paused: sc.run_docker(["unpause", ...])`
+    # exactly as main() runs them in sequence, proving the retry the
+    # review required actually happens end to end.
+    def test_outer_teardown_retries_unpause_after_inner_failure(self) -> None:
+        sc, calls = self._scripted_sc([
+            self._ok(returncode=1, stderr="daemon busy"),  # inner (A-6 finally) attempt
+            self._ok(returncode=0),  # outer teardown retry
+        ])
+
+        state_is_paused = True
+        # Inner finally (main()'s A-6 pause-proof try/finally):
+        if self.module._unpause_state_container(sc, "c"):
+            state_is_paused = False
+        self.assertTrue(state_is_paused)
+
+        # Outer teardown finally (main()'s own top-level finally, unchanged
+        # by this fix - only re-attempts when the flag is still True):
+        if state_is_paused:
+            sc.run_docker(["unpause", "c"])
+
+        self.assertEqual(calls, [["unpause", "c"], ["unpause", "c"]])
+
+    # D: original/action failure semantics preserved - the helper must
+    # never raise on its own and must never swallow an exception already
+    # in flight when it runs inside a `finally` block, exactly as
+    # `_unpause_state_container` does inside main()'s real try/finally.
+    def test_helper_does_not_swallow_an_in_flight_exception(self) -> None:
+        sc, _ = self._scripted_sc([self._ok(returncode=1, stderr="daemon busy")])
+
+        def _raise_then_cleanup() -> None:
+            try:
+                raise ValueError("original A-6 scenario failure")
+            finally:
+                # A failed unpause here must not itself raise, and must not
+                # suppress the ValueError already propagating.
+                self.module._unpause_state_container(sc, "c")
+
+        with self.assertRaises(ValueError):
+            _raise_then_cleanup()
+
+    def test_no_infinite_retry_single_attempt_per_call(self) -> None:
+        """A single call issues exactly one `docker unpause` - retrying is
+        the OUTER teardown's job (one bounded extra attempt), never a loop
+        inside this helper itself."""
+        sc, calls = self._scripted_sc([self._ok(returncode=1, stderr="daemon busy")])
+        self.module._unpause_state_container(sc, "c")
+        self.assertEqual(len(calls), 1)
 
 
 class SigtermHandlingTests(unittest.TestCase):

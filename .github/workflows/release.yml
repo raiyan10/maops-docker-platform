@@ -176,11 +176,26 @@ jobs:
           fi
           echo "no existing release found for $TAG - safe to publish"
 
-      - name: Compute SHA256SUMS for attached artifacts
+      # Day 7 (closes DAY6-POST-M1, docs/engineering-reviews/day-06-post-
+      # release-verification.md §7.1): stages a FLAT, consumer-shaped
+      # bundle - each release asset under its own basename, plus a
+      # SHA256SUMS manifest that references those exact basenames - and
+      # independently proves the real, unmodified `sha256sum -c
+      # SHA256SUMS` succeeds in that directory before anything is
+      # published. This script (scripts/release/prepare_release_bundle.py),
+      # not this workflow's own YAML, is the authoritative release-bundle
+      # policy - see the Makefile's `release-bundle` target for the
+      # identical local contract.
+      # --version is omitted deliberately: the script's own default reads
+      # the repository-root VERSION file, which the `validate` job's
+      # check_release_context.py already proved equals this exact tag
+      # (`tag_matches_version`) - never re-derived from the tag string a
+      # second time here.
+      - name: Prepare consumer-verifiable release bundle
         run: |
-          find release-evidence -type f \( -name '*.json' \) -print0 \
-            | xargs -0 sha256sum > SHA256SUMS
-          cat SHA256SUMS
+          python3 scripts/release/prepare_release_bundle.py \
+            --source-dir release-evidence \
+            --out release-bundle
 
       - name: Create GitHub Release
         run: |
@@ -188,6 +203,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "maops-docker-platform $TAG" \
             --notes-file "docs/releases/${TAG}.md" \
-            release-evidence/sbom/*.spdx.json \
-            release-evidence/security/*.json \
-            SHA256SUMS
+            release-bundle/*

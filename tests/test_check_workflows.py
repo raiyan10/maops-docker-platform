@@ -402,6 +402,128 @@ class ReleaseContextValidationIsAuthoritativeTests(unittest.TestCase):
         self.assertTrue(any("must run before" in str(f) for f in findings))
 
 
+GOOD_RELEASE_WITH_GUARD = """\
+name: Release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: make release-check
+  publish:
+    needs: validate
+    if: >-
+      success() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse to overwrite an existing release (immutability)
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::already exists"
+            exit 1
+          fi
+      - name: Create GitHub Release
+        run: |
+          gh release create "$TAG" \\
+            --repo "$GITHUB_REPOSITORY" \\
+            release-bundle/*
+"""
+
+
+class NoReleaseClobberTests(unittest.TestCase):
+    """Day 7 (DAY7-RELENG-L1): the publish job's existing-release guard
+    must actually be present, actually fail the job on a hit, run before
+    'gh release create', and 'gh release create' must never carry
+    --clobber - now enforced automatically rather than only by a human
+    reading release.yml's source."""
+
+    def setUp(self) -> None:
+        self.module = load_check_workflows()
+
+    def test_valid_current_release_workflow_passes(self) -> None:
+        self.assertEqual(
+            self.module.check_no_release_clobber({"release.yml": GOOD_RELEASE_WITH_GUARD}), []
+        )
+
+    def test_missing_existing_release_guard_is_rejected(self) -> None:
+        bad = GOOD_RELEASE_WITH_GUARD.replace(
+            "      - name: Refuse to overwrite an existing release (immutability)\n"
+            "        run: |\n"
+            '          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then\n'
+            '            echo "::error::already exists"\n'
+            "            exit 1\n"
+            "          fi\n",
+            "",
+        )
+        findings = self.module.check_no_release_clobber({"release.yml": bad})
+        self.assertTrue(any("must guard" in str(f) for f in findings))
+
+    def test_clobber_flag_on_gh_release_create_is_rejected(self) -> None:
+        bad = GOOD_RELEASE_WITH_GUARD.replace(
+            'gh release create "$TAG" \\', 'gh release create "$TAG" --clobber \\'
+        )
+        findings = self.module.check_no_release_clobber({"release.yml": bad})
+        self.assertTrue(any("--clobber" in str(f) for f in findings))
+
+    def test_guard_placed_after_release_create_is_rejected(self) -> None:
+        guard_step = (
+            "      - name: Refuse to overwrite an existing release (immutability)\n"
+            "        run: |\n"
+            '          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then\n'
+            '            echo "::error::already exists"\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        create_step = (
+            "      - name: Create GitHub Release\n"
+            "        run: |\n"
+            '          gh release create "$TAG" \\\n'
+            '            --repo "$GITHUB_REPOSITORY" \\\n'
+            "            release-bundle/*\n"
+        )
+        bad = GOOD_RELEASE_WITH_GUARD.replace(guard_step, "").replace(create_step, create_step + guard_step)
+        findings = self.module.check_no_release_clobber({"release.yml": bad})
+        self.assertTrue(any("must run BEFORE" in str(f) for f in findings))
+
+    def test_guard_outside_publish_job_does_not_satisfy_requirement(self) -> None:
+        """A guard-shaped step sitting in 'validate' (which never runs
+        'gh release create') must not be mistaken for satisfying the
+        publish job's own requirement."""
+        guard_step = (
+            "      - name: Refuse to overwrite an existing release (immutability)\n"
+            "        run: |\n"
+            '          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then\n'
+            '            echo "::error::already exists"\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        misplaced = GOOD_RELEASE_WITH_GUARD.replace(guard_step, "").replace(
+            "      - run: make release-check\n", "      - run: make release-check\n" + guard_step
+        )
+        findings = self.module.check_no_release_clobber({"release.yml": misplaced})
+        self.assertTrue(any("must guard" in str(f) for f in findings))
+
+    def test_unrelated_clobber_word_in_comment_is_not_a_false_positive(self) -> None:
+        text = self.module._strip_comments(
+            GOOD_RELEASE_WITH_GUARD + "\n# note: never pass --clobber to gh release create\n"
+        )
+        self.assertEqual(self.module.check_no_release_clobber({"release.yml": text}), [])
+
+
 class RequiredFilesExistTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_check_workflows()
