@@ -32,8 +32,15 @@ orchestration layer over it.
 make quality        # test, lint, dockerfile-check, compose-check, workflow-check
 make release-check   # quality, build, inspect, image-audit, smoke, security-check,
                       #   compose-test, reliability-check, reproducibility-check,
-                      #   supply-chain-check (sbom, sbom-check, vuln-scan)
+                      #   supply-chain-check (sbom, sbom-check, vuln-scan),
+                      #   patch-lifecycle-check, release-bundle
 ```
+
+`patch-lifecycle-check` and `release-bundle` (Day 7) are documented in
+full in `docs/production-readiness.md` §1.1/§1.2 and
+`docs/build-security.md`'s "Day 7: runtime security-patch lifecycle
+tripwire" section — the same "Makefile is authoritative, CI orchestrates
+it" principle applies to both; neither is reimplemented in workflow YAML.
 
 `workflow-check` (`scripts/ci/check_workflows.py`, new this day) is folded
 into `quality` — a malformed or insecure workflow-YAML change now fails the
@@ -214,15 +221,40 @@ does not relax it):
   "successful" update whose inspected values don't match is a real
   verification failure and is never retried.
 - `docker update` exits non-zero: the stderr is checked against a narrow
-  classifier, `_is_transient_cgroup_update_race()`, requiring ALL THREE of
-  `"runc did not terminate successfully"`, `"cgroup.controllers"`, and
-  `"no such file or directory"` together - not any one alone (a bare "no
-  such file or directory" is common to many genuinely non-retryable
-  Docker/runc errors and must never by itself be treated as retryable).
-  Any other error - `permission denied`, `invalid memory limit`, `invalid
+  classifier, `_is_transient_cgroup_update_race()`. As of Day 7
+  (`DAY6-POST-M2`, see `docs/production-readiness.md` §1.3, and
+  `docs/reliability.md`'s own dedicated section for the full history of
+  both real occurrences), this requires ALL of:
+
+  - the literal `"runc did not terminate successfully"` wrapper phrase;
+  - a genuine `openat2 <path>: no such file or directory` regex match
+    (real ENOENT-on-`openat2` semantics - a bare "no such file or
+    directory" appearing anywhere else in the message is common to many
+    genuinely non-retryable Docker/runc errors and must never by itself
+    be treated as retryable);
+  - the missing path's directory containing a real `/cgroup/` hierarchy
+    segment (real cgroup-path context, never a same-named file living
+    somewhere else); and
+  - the missing path's basename being one of a small, explicitly
+    enumerated, deliberately restricted set -
+    `{"cgroup.controllers", "memory.max"}` - never a broad "any
+    cgroup-shaped filename" wildcard. `cgroup.controllers` is the
+    original GitHub run `32960673438` signature; `memory.max` is a
+    closely related but distinct variant a later post-release
+    evidence-commit run (`33059581018`) hit, immediately after a genuine
+    Scenario 1 OOM crash and automatic restart - both are real,
+    independently evidenced GitHub-hosted-runner occurrences, never
+    speculative. Extending this set again requires a new, independently
+    observed real GitHub Actions failure.
+
+  Arbitrary `runc` errors are **not** retried; an unrelated missing file
+  is **not** retried; `permission denied` (a real `openat2` failure that
+  is not ENOENT) is **not** retried; `invalid memory limit`, `invalid
   argument`, `container not found`, daemon-unavailable, an unknown-flag/
-  CLI-syntax error, or an actual policy/verification mismatch - fails
-  immediately, with no retry.
+  CLI-syntax error, or an actual policy/verification mismatch all fail
+  immediately, with no retry; `pids.max`/`cpu.max`/other unapproved cgroup
+  filenames are **not** automatically retried even with an otherwise
+  byte-identical error.
 - On a recognized transient race, `HostConfig` is inspected BEFORE
   retrying (`dockerd`/`runc` can genuinely return non-zero after a partial
   operation): an exact match returns success without reissuing `docker
@@ -463,11 +495,18 @@ correctly").
 
 **Automated GitHub Release**: `publish` downloads the `validate` job's
 `release-evidence` artifact (the SBOM + Trivy JSON already generated and
-validated by `make release-check`, not regenerated a second time),
-computes `SHA256SUMS` over the downloaded files, and calls `gh release
-create` (GitHub CLI, already present on the runner — no third-party release
-action) with `docs/releases/${TAG}.md` as `--notes-file` and the SBOM,
-Trivy report, and `SHA256SUMS` as attached assets. `GH_TOKEN` is the
+validated by `make release-check`, not regenerated a second time), then
+runs `scripts/release/prepare_release_bundle.py` (Day 7, closes
+DAY6-POST-M1 — see `docs/production-readiness.md` §1.2) to stage a flat,
+basename-only `release-bundle/` directory and independently prove the
+real, unmodified `sha256sum -c SHA256SUMS` succeeds against it — never
+computing checksums inline in this workflow's own YAML. `gh release
+create` (GitHub CLI, already present on the runner — no third-party
+release action) then runs with `docs/releases/${TAG}.md` as
+`--notes-file` and `release-bundle/*` (the SBOM, Trivy report, and
+`SHA256SUMS`, verbatim) as attached assets — the exact same three files a
+consumer downloads, so what was verified locally is what gets published,
+with no separate re-derivation step in between. `GH_TOKEN` is the
 built-in `secrets.GITHUB_TOKEN`, scoped to `contents: write` by the job's
 own `permissions:` block — not a personal access token, not a
 registry credential.

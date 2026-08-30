@@ -16,6 +16,41 @@ application is intentionally tiny — a few JSON endpoints — so that
 essentially all of the engineering effort and all of the review surface
 is the container layer, not application logic.
 
+## Day 7 additions (final hardening, production readiness, v1.0.0 preparation)
+
+Release-*candidate* preparation only — no runtime redesign, and no
+`v1.0.0` tag/GitHub Release created yet (that follows independent review,
+exactly as `v0.6.0` did). `VERSION` bumped `0.6.0` -> `1.0.0`.
+
+- **Runtime security-patch lifecycle tripwire**: `scripts/security/
+  patch_lifecycle_check.py` (`make patch-lifecycle-check`) independently
+  `docker pull`s the exact pinned Distroless base (derived from
+  `docker/app/Dockerfile`'s own `FROM` text, never a duplicated constant)
+  and proves whether `security/runtime-patches.lock`'s emergency
+  `libssl3t64` overlay is still required, now redundant, or has drifted
+  from its own documented rationale — using real Debian version-
+  comparison semantics (`scripts/security/debian_version.py`). See
+  [docs/build-security.md](docs/build-security.md).
+- **Consumer-verifiable release checksums**: `scripts/release/
+  prepare_release_bundle.py` (`make release-bundle`) stages a flat,
+  basename-only release bundle and independently proves the real,
+  unmodified `sha256sum -c SHA256SUMS` succeeds against it — closing a
+  real defect found in the published `v0.6.0` release (its `SHA256SUMS`
+  referenced CI-internal paths a normal flat download couldn't verify
+  against).
+- **Hardened post-restart cgroup-v2 race classifier**:
+  `reliability_check.py`'s transient-failure classifier now recognizes a
+  second, newly evidenced real GitHub Actions failure signature
+  (`memory.max` disappearing, alongside the original
+  `cgroup.controllers`), via a deliberately narrow, explicitly enumerated
+  filename allowlist plus real path-context/ENOENT-semantics matching.
+- **Historical debt sweep**: every still-relevant Low/Medium engineering-
+  review finding from Days 1-6 was reviewed and adjudicated (closed,
+  accepted, or explicitly still open) — including materially closing a
+  Day 4 finding that `image_audit.py`'s base-digest cross-check was
+  partially tautological. See
+  [docs/production-readiness.md](docs/production-readiness.md).
+
 ## Day 6 additions (CI/CD and release engineering)
 
 - **A GitHub Actions delivery plane** layered on top of the unchanged
@@ -283,22 +318,29 @@ scripts/compose/         # project-specific Compose structural + integration che
 scripts/smoke/           # real-image container smoke test (single-role + multi-role)
 scripts/verify/          # runtime security verification
 scripts/build/           # deterministic-build reproducibility proof + image policy audit (Day 4)
-scripts/security/        # SBOM generation/validation + vulnerability scan/policy (Day 4)
+scripts/security/        # SBOM generation/validation + vulnerability scan/policy (Day 4);
+                         #   runtime patch-lock parsing + patch-lifecycle tripwire + Debian
+                         #   version comparison (Day 7)
 scripts/reliability/     # real resource/restart/timeout-hierarchy/failure-recovery proof (Day 5)
 scripts/ci/              # GitHub Actions workflow policy validator (Day 6)
-scripts/release/         # release-context (VERSION/tag/history) validator (Day 6)
-docs/releases/           # version-specific GitHub Release notes (Day 6)
+scripts/release/         # release-context (VERSION/tag/history) validator (Day 6);
+                         #   consumer-verifiable release-bundle staging (Day 7)
+docs/releases/           # version-specific GitHub Release notes (Day 6+)
 artifacts/               # generated SBOM/vulnerability-report output (git-ignored)
+release-bundle/          # flat, consumer-verifiable release bundle output (Day 7, git-ignored)
 docs/                    # architecture, security, networking, configuration,
                          #   persistence, compose platform, build security,
-                         #   supply chain, reliability, ci-cd, roadmap
+                         #   supply chain, reliability, ci-cd, roadmap,
+                         #   production readiness (Day 7)
 .claude/                 # project agents, skills, and guidance
 VERSION                  # single authoritative version source
 ```
 
 ## Current version
 
-`0.6.0` (see `VERSION`) — Day 6 of 7.
+`1.0.0` (see `VERSION`) — Day 7 of 7, release-candidate preparation. See
+[docs/releases/v1.0.0.md](docs/releases/v1.0.0.md) and
+[docs/production-readiness.md](docs/production-readiness.md).
 
 ## Seven-day roadmap (high level)
 
@@ -309,8 +351,8 @@ VERSION                  # single authoritative version source
 | 3 | Networking, configuration, volumes, persistence |
 | 4 | Build/image security and reproducibility |
 | 5 | Health, reliability, resource controls |
-| 6 | CI/CD, integration, release engineering *(this release)* |
-| 7 | Hardening, reviews, showcase -> v1.0.0 |
+| 6 | CI/CD, integration, release engineering |
+| 7 | Hardening, reviews, showcase -> v1.0.0 *(this release)* |
 
 Full detail: [docs/roadmap.md](docs/roadmap.md).
 

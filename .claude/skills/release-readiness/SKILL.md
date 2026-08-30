@@ -138,11 +138,21 @@ CI/CD automates *validation*, not the decision to actually cut a release.
     (test -> lint -> dockerfile-check -> compose-check -> workflow-check)
     -> build -> inspect -> image-audit -> smoke -> security-check ->
     compose-test -> reliability-check -> reproducibility-check ->
-    supply-chain-check (sbom -> sbom-check -> vuln-scan)`). Every failure
-    must propagate; nothing in this chain may silently swallow a nonzero
-    exit code. This is also exactly what `.github/workflows/ci.yml`'s
+    supply-chain-check (sbom -> sbom-check -> vuln-scan) ->
+    patch-lifecycle-check -> release-bundle`). Every failure must
+    propagate; nothing in this chain may silently swallow a nonzero exit
+    code. This is also exactly what `.github/workflows/ci.yml`'s
     `release-policy` job and `.github/workflows/release.yml`'s `validate`
     job both run — see `docs/ci-cd.md`.
+    - **`patch-lifecycle-check` (Day 7)** — `scripts/security/
+      patch_lifecycle_check.py` independently pulls the exact pinned
+      Distroless base and proves whether `security/runtime-patches.lock`'s
+      emergency overlay is still required, now redundant, or has drifted
+      from its own recorded rationale. See `docs/build-security.md`.
+    - **`release-bundle` (Day 7)** — `scripts/release/
+      prepare_release_bundle.py` stages the flat, consumer-shaped release
+      bundle and independently proves the real `sha256sum -c SHA256SUMS`
+      succeeds against it. See `docs/production-readiness.md` §1.2.
 
 14. **PR** — only when the user explicitly asks for one. Do not create a
     GitHub repository, PR, tag, or release on your own initiative. Once a
@@ -169,8 +179,11 @@ CI/CD automates *validation*, not the decision to actually cut a release.
     after step 15 passes on `main`. Pushing the real `vMAJOR.MINOR.PATCH`
     tag is what triggers `.github/workflows/release.yml`'s real
     publication path (tag/`VERSION` equality, main-history ancestry,
-    `make release-check`, then an automated GitHub Release with SBOM/
-    Trivy-report/`SHA256SUMS` attached) — this is a one-way, immutable
+    `make release-check`, then an automated GitHub Release with the flat,
+    consumer-verifiable release bundle attached — SBOM, Trivy report, and
+    a basename-only `SHA256SUMS` a consumer can run `sha256sum -c` against
+    unmodified, see `docs/production-readiness.md` §1.2) — this is a
+    one-way, immutable
     operation (no tag is ever moved/rewritten, no existing GitHub Release
     is ever overwritten), so treat pushing the tag with the same care as
     any other irreversible action.

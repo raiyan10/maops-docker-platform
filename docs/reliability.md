@@ -351,6 +351,53 @@ used as a correctness assertion, no `shell=True`/`os.system`/`os.popen`:
    observable local behavior change — `make reliability-check` still
    reports `32/32`.
 
+   **Day 7 (`DAY6-POST-M2`, see `docs/production-readiness.md` §1.3):**
+   a second, distinct real occurrence of the same underlying post-restart
+   race (GitHub run `33059581018`, a post-release evidence-commit run,
+   immediately after a genuine Scenario 1 OOM crash and automatic
+   restart) hit `memory.max` instead of `cgroup.controllers`, which the
+   Day 6 classifier correctly (per its own narrow design) refused to
+   retry, failing that run. `_is_transient_cgroup_update_race()` was
+   widened conservatively — never loosened to a general "any cgroup
+   error" retry — requiring, in order, ALL of:
+
+   - the literal `"runc did not terminate successfully"` wrapper phrase;
+   - a genuine `openat2 <path>: no such file or directory` match (real
+     ENOENT-on-`openat2` semantics via a regex, not merely the words "no
+     such file or directory" appearing anywhere in the message);
+   - the missing path's directory containing a real `/cgroup/` hierarchy
+     segment (real cgroup-path context, not merely a same-named file
+     living somewhere else); and
+   - the missing path's basename being one of a small, explicitly
+     enumerated, deliberately restricted set —
+     `{cgroup.controllers, memory.max}` — never a broad "any
+     cgroup-shaped filename" wildcard.
+
+   Consequences of this being a conjunction, not a loosened match:
+   arbitrary `runc` errors are **not** retried; an unrelated missing file
+   (even one that happens to say "no such file or directory") is **not**
+   retried; `permission denied` (a real `openat2` failure that is not
+   ENOENT) is **not** retried; `pids.max`/`cpu.max`/`memory.swap.max` or
+   any other cgroup-shaped filename — never observed, not accepted — is
+   **not** automatically retried, even with an otherwise byte-identical
+   error. Extending the accepted-filename set again requires a new,
+   independently observed real GitHub Actions failure, not speculation.
+   The retry itself remains exactly as bounded as the Day 6 design: a
+   real `time.monotonic()`-measured deadline (never wall-clock/`datetime`
+   based), a bounded sleep between attempts (never a busy loop), and —
+   on every success path, first-try or retried — `HostConfig.Memory`/
+   `HostConfig.MemorySwap` are re-inspected via a real `docker inspect`
+   and must **exactly** match the expected values before the helper
+   returns; a "successful" `docker update` whose inspected values don't
+   match is a real verification failure, never inferred from exit code
+   alone. See `docs/production-readiness.md` §1.3 for this finding's
+   precise evidence-tier disposition (code-level closed; live-recurrence
+   confirmation against a fresh real occurrence remains pending) and
+   `tests/test_reliability_check.py`'s
+   `TransientCgroupUpdateRaceClassifierTests`/
+   `UpdateContainerResourcesVerifiedTests` for the Docker-free positive
+   and negative unit coverage of every branch above.
+
    Only *after* the bound is
    proven (and the memory limit already restored by that `finally` block)
    does the script issue an explicit `docker compose start state` —

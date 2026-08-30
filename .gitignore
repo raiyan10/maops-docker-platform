@@ -34,3 +34,9 @@ htmlcov/
 # ignored. See docs/build-security.md / docs/supply-chain.md.
 artifacts/
 .cache/
+
+# Day 7: flat, consumer-verifiable release-bundle staging output
+# (scripts/release/prepare_release_bundle.py) - locally regenerated, never
+# committed. See docs/engineering-reviews/day-06-post-release-verification.md
+# §7.1 and docs/releases/v1.0.0.md.
+release-bundle/

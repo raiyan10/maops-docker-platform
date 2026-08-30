@@ -178,6 +178,74 @@ The build remains strongly reproducible (`make reproducibility-check`):
 on every build, so two independent `--no-cache` builds still produce an
 exact image-ID match.
 
+## Day 7: runtime security-patch lifecycle tripwire
+
+The overlay above is a deliberate, **temporary** exception, not a
+permanent fixture. Its explicit exit condition: once the pinned
+Distroless base itself ships a `libssl3t64` build at least as new as the
+overlay's own patched version (`security/runtime-patches.lock`'s
+`LIBSSL_VERSION`), the overlay becomes redundant and must be explicitly
+removed from `docker/app/Dockerfile` and `security/runtime-patches.lock`
+- keeping it in place past that point would be dead weight at best, and
+could silently *downgrade* the runtime if the base ever shipped something
+newer than the overlay.
+
+`scripts/security/patch_lifecycle_check.py` (`make patch-lifecycle-check`,
+part of `make release-check`) is the automated tripwire for exactly this
+condition - a fourth layer of proof alongside the three already listed
+above, following this project's own `[A]`/`[B]`/`[C]`/`[D]` evidence-tier
+discipline (`docs/security.md`; see also that document's "Day 6 addition:
+emergency Debian-security overlay evidence chain" for the same discipline
+applied to the overlay's payload itself):
+
+- **`[A]` source/static evidence** - it derives the pinned final base's
+  (repository, digest) directly from this Dockerfile's own real, parsed
+  `FROM` text (`scripts/security/base_image_ref.py` - never a second
+  hand-copied digest constant, so the check cannot become tautological by
+  construction).
+- **`[B]` image inspection / package-metadata evidence** - it
+  independently `docker pull`s that exact pinned digest (a fresh pull,
+  not a reuse of any build-time layer cache), `docker create`s (never
+  `docker run`/`exec` - Distroless has no shell) a throwaway container
+  from that pulled base, and `docker cp`s out its own real
+  `/var/lib/dpkg/status.d/libssl3t64` metadata - the same layout this
+  project's own overlay writes to - to read the REAL `libssl3t64` version
+  that base currently ships. This is `[B]`-tier evidence specifically:
+  genuine image/package-metadata inspection of the independently pulled
+  base, not merely a claim re-stated from the Dockerfile's own comments.
+  This tripwire does not itself perform a `[D]` kernel/runtime proof (no
+  process is exec'd, no live library is loaded) - the `[D]`-tier proof
+  that the *built release image's own* patched OpenSSL binaries actually
+  load and function at runtime is a separate, already-established check
+  (`image_audit.py`'s content-hash and `ssl` module checks, `docs/
+  security.md`'s Day 6 section) and is unaffected by this tripwire.
+
+That real, `[B]`-tier observed version is compared against
+`security/runtime-patches.lock`'s recorded
+`LIBSSL_VULNERABLE_VERSION`/`LIBSSL_VERSION` using genuine Debian
+version-comparison semantics (`scripts/security/debian_version.py` -
+Debian Policy §5.6.12's algorithm, not string/tuple comparison, which
+gets `~deb13uN`-style revisions wrong), producing one of four outcomes:
+
+- the base is still older than the patched version, and matches the
+  lock's own recorded vulnerable version -> overlay still **required**,
+  PASS;
+- the base is now at or past the patched version -> overlay now
+  **redundant**, FAIL (explicit review/removal required - never silently
+  passes);
+- the base's real version could not be established at all (pull/extract
+  failure, unparseable version) -> FAIL (never silently assumed
+  still-required);
+- the base is still older than the patched version, but does not match
+  the lock's recorded vulnerable version -> the lock's own documented
+  rationale has drifted from reality -> FAIL (prompting a lock update).
+
+See `docs/production-readiness.md` §1.1 for the real evidence this
+produced against the actual pinned base as of this writing, and
+`tests/test_debian_version.py`/`tests/test_patch_lifecycle_check.py` for
+the Docker-free unit coverage of the comparison/classification logic
+itself.
+
 ## Deterministic build strategy (unchanged mechanism, still verified after migration)
 
 `make build` still uses `docker buildx build` with BuildKit's own
