@@ -1,8 +1,7 @@
 # Roadmap
 
-Seven-day portfolio arc. Only Days 1-6 are implemented; everything under
-a later day below is **planned, not implemented** — do not read a later
-day's bullet list as describing current behavior.
+Seven-day portfolio arc. All seven days are implemented, closing at the
+released `v1.0.0`.
 
 ## Day 1 — Secure container foundation (v0.1.0, implemented)
 
@@ -376,18 +375,22 @@ runtime plane — see `docs/ci-cd.md` for the full design.
   `docs/supply-chain.md`. The Distroless base digest and the runtime
   topology above are both unchanged.
 
-## Day 7 — Hardening, reviews, showcase -> v1.0.0 (implemented)
+## Day 7 — Hardening, reviews, showcase -> v1.0.0 (implemented, released)
 
 Final hardening and production-readiness pass across the full seven-day
 build — no runtime redesign: the same three services, one image, two
 networks, one named volume, and hardening properties Days 1-6 already
-established. `VERSION` bumped `0.6.0` -> `1.0.0`. See
-`docs/production-readiness.md` (the implementation-time debt ledger and
-the final production-readiness contract) and
-`docs/releases/v1.0.0.md` (release-candidate notes — this is
-release-*candidate* preparation; the `v1.0.0` tag/GitHub Release
-themselves follow only after independent review, exactly as `v0.6.0`
-did).
+established. `VERSION` bumped `0.6.0` -> `1.0.0`, independently reviewed,
+and released as the tagged, published
+[`v1.0.0` GitHub Release](https://github.com/raiyan10/maops-docker-platform/releases/tag/v1.0.0)
+(SBOM, Trivy vulnerability report, and `SHA256SUMS` attached; a fresh
+consumer-side `sha256sum -c SHA256SUMS` verification of the published
+assets passed — see `docs/engineering-reviews/day-07-post-release-
+verification.md`). See `docs/production-readiness.md` (the
+implementation-time debt ledger and the final production-readiness
+contract) and `docs/releases/v1.0.0.md` (the pre-release notes written
+during Day 7 implementation, describing release-candidate preparation as
+it stood at that point in time — preserved as written).
 
 Three Day-6-carried Medium findings closed:
 

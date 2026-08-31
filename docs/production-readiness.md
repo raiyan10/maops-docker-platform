@@ -1,12 +1,19 @@
-# Production readiness — Day 7 (v1.0.0 release-candidate preparation)
+# Production readiness — Day 7 (v1.0.0, released)
 
 This document is Day 7's implementation-time **debt ledger** (every
 still-relevant Low/Medium finding raised across Days 1-6's engineering
 reviews, adjudicated) and the final **production-readiness contract**
-this project ships as `v1.0.0`. It is release-*candidate* preparation
-only — see [docs/releases/v1.0.0.md](releases/v1.0.0.md); the `v1.0.0`
-Git tag and GitHub Release are not created by this document or by this
-implementation pass.
+this project ships as `v1.0.0`. `v1.0.0` has since been independently
+reviewed, tagged, and published as a
+[GitHub Release](https://github.com/raiyan10/maops-docker-platform/releases/tag/v1.0.0)
+— see [docs/releases/v1.0.0.md](releases/v1.0.0.md) for the pre-release
+notes written during this implementation pass (preserved as written) and
+[docs/engineering-reviews/day-07-post-release-verification.md](engineering-reviews/day-07-post-release-verification.md)
+for the fresh consumer-side verification of the published release
+assets. The debt-ledger adjudications below (§1-§3), including §1.3's
+`DAY6-POST-M2` "CODE-LEVEL CLOSED — LIVE RECURRENCE CONFIRMATION
+PENDING" status, are preserved unmodified from this implementation
+pass.
 
 `make release-check` remains the single authoritative local validation
 contract (identical in CI — `.github/workflows/ci.yml`'s

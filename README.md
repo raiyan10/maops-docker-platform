@@ -1,8 +1,9 @@
 # MAOps Docker Platform
 
 A secure, minimal Docker/Compose platform foundation — Project 3 of the
-MAOps DevOps portfolio, built as seven scoped daily releases starting
-from v0.1.0.
+MAOps DevOps portfolio, built as seven scoped daily releases from v0.1.0
+through the current stable release,
+[v1.0.0](https://github.com/raiyan10/maops-docker-platform/releases/tag/v1.0.0).
 
 ## What this is
 
@@ -16,11 +17,15 @@ application is intentionally tiny — a few JSON endpoints — so that
 essentially all of the engineering effort and all of the review surface
 is the container layer, not application logic.
 
-## Day 7 additions (final hardening, production readiness, v1.0.0 preparation)
+## Day 7 additions (final hardening, production readiness, v1.0.0 release)
 
-Release-*candidate* preparation only — no runtime redesign, and no
-`v1.0.0` tag/GitHub Release created yet (that follows independent review,
-exactly as `v0.6.0` did). `VERSION` bumped `0.6.0` -> `1.0.0`.
+Final hardening and production-readiness pass — no runtime redesign.
+`VERSION` bumped `0.6.0` -> `1.0.0`, independently reviewed, tagged, and
+published as the
+[`v1.0.0` GitHub Release](https://github.com/raiyan10/maops-docker-platform/releases/tag/v1.0.0),
+with a fresh consumer-side `sha256sum -c SHA256SUMS` verification of the
+published release assets recorded in
+[docs/engineering-reviews/day-07-post-release-verification.md](docs/engineering-reviews/day-07-post-release-verification.md).
 
 - **Runtime security-patch lifecycle tripwire**: `scripts/security/
   patch_lifecycle_check.py` (`make patch-lifecycle-check`) independently
@@ -225,9 +230,8 @@ exactly as `v0.6.0` did). `VERSION` bumped `0.6.0` -> `1.0.0`.
   process-level proof, including an automated `docker stop`/SIGTERM
   lifecycle check (see [docs/security.md](docs/security.md)).
 
-See [docs/roadmap.md](docs/roadmap.md) for the full seven-day arc — only
-Days 1-6 are implemented; everything else is explicitly planned, not
-built.
+See [docs/roadmap.md](docs/roadmap.md) for the full seven-day arc — all
+seven days are implemented, closing at the `v1.0.0` release.
 
 ## Prerequisites
 
@@ -338,9 +342,15 @@ VERSION                  # single authoritative version source
 
 ## Current version
 
-`1.0.0` (see `VERSION`) — Day 7 of 7, release-candidate preparation. See
-[docs/releases/v1.0.0.md](docs/releases/v1.0.0.md) and
-[docs/production-readiness.md](docs/production-readiness.md).
+`1.0.0` (see `VERSION`) — Day 7 of 7, released and independently
+reviewed. See the
+[`v1.0.0` GitHub Release](https://github.com/raiyan10/maops-docker-platform/releases/tag/v1.0.0)
+(SBOM, Trivy vulnerability report, and `SHA256SUMS` attached; consumer
+`sha256sum -c SHA256SUMS` verification recorded in
+[docs/engineering-reviews/day-07-post-release-verification.md](docs/engineering-reviews/day-07-post-release-verification.md)),
+[docs/releases/v1.0.0.md](docs/releases/v1.0.0.md) for the pre-release
+notes, and [docs/production-readiness.md](docs/production-readiness.md)
+for the full production-readiness ledger.
 
 ## Seven-day roadmap (high level)
 
